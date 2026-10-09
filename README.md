@@ -1,5 +1,7 @@
 # autoreview-ui
 
+![Ma'at, Egyptian goddess of truth and justice, in a blue faience relief tablet](docs/banner.jpg)
+
 **Maat weighs your UI against the feather.** A skill for AI coding agents that reviews how a UI actually renders, before you ship it.
 
 [`autoreview`](https://github.com/openclaw/agent-skills/tree/main/skills/autoreview) reads code. `autoreview-ui` looks at the result: it opens your running app, takes screenshots at several screen sizes and states, checks accessibility, scans the source for lazy shortcuts, and then judges everything against your own design system.
@@ -67,6 +69,8 @@ npm run bootstrap
 - **[`autoreview`](https://github.com/openclaw/agent-skills/tree/main/skills/autoreview)** from [openclaw/agent-skills](https://github.com/openclaw/agent-skills) (MIT). This skill is built as its companion and follows the same idea: an independent reviewer that gives advice to verify, not orders to apply. Go use that one for code review.
 - Its sibling for user journeys: [`ogun-ux-paths`](https://github.com/Svixel/ogun-ux-paths). It reuses this skill's screenshot driver.
 - Playwright and axe-core do the capturing and the accessibility audit.
+
+Banner image generated with Grok Imagine 2.0 (xAI) via fal.ai: Ma'at in the style of an Egyptian faience relief.
 
 ## Status and licence
 
