@@ -70,4 +70,4 @@ npm run bootstrap
 
 ## Status and licence
 
-Personal tooling, shared as is, maintained by [@Svixel](https://github.com/Svixel). No licence is set yet, so ask before reusing it commercially.
+Shared as is, maintained by [@Svixel](https://github.com/Svixel). Released under the [MIT licence](LICENSE).
