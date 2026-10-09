@@ -1,0 +1,13 @@
+{
+  "screenshot": {
+    "status": "available",
+    "libraryPath": "runs/3f2b7c1e-8a4d-4c6b-9e2f-1a5d7b9c0e42/shots/settings.w1440.full.png",
+    "sha256": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "rubricVersion": "rubric.v1",
+  "curator": "example ui:review triage, 2026-08-11",
+  "expectedFindings": [
+    "Detail screens use the standard page shell and shared header instead of a raw background root and a one-off rounded container."
+  ],
+  "severity": "P2"
+}

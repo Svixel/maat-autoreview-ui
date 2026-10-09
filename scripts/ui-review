@@ -1,0 +1,1740 @@
+#!/usr/bin/env node
+/**
+ * ui-review — orchestrator for the autoreview-ui skill.
+ *
+ * Deterministic plumbing only; the VISION judgement is done by the calling
+ * agent (see SKILL.md). For a project it:
+ *   1. runs ui-scan over the change (the code "laziness tells"),
+ *   2. drives shoot.mjs to screenshot the selected routes across viewports +
+ *      interaction states and run axe,
+ *   3. assembles a bundle.json + prints a summary pointing the agent at the
+ *      screenshots, the rubric, and the design intent.
+ *
+ * Self-contained: reads a project config from this skill's projects/<name>.json
+ * (or --config), writes only to an out dir (never the project repo), and
+ * imports no project code.
+ *
+ *   ui-review --project acme-web [--targets login,admin-dashboard]
+ *             [--base origin/main] [--out DIR] [--no-shots] [--no-scan] [--no-library] [--json]
+ *   ui-review --project <name> --verify-fresh [--base <sha>] [--targets id1,id2-or-group] [--json]
+ *   ui-review --record events.json --run capture-dir [--project name | --config config.json] [--json]
+ *   ui-review --judge-pack --run capture-dir [--targets id1,id2-or-group] [--previous-pack manifest.json] [--project name | --config config.json] [--json]
+ *
+ * Two capture backends, chosen by the config's `capture.mode`:
+ *   "playwright" (default, and what an absent `capture` block means) — a web
+ *     dev server driven by shoot.mjs.
+ *   "rn-sim" — a React Native app on a booted iOS Simulator, driven by
+ *     shoot-rn.mjs. See SKILL.md → Capture backends.
+ *
+ * Exit 0 = intent + capture + automated checks are clean; nonzero = missing
+ * intent, scan findings, capture/config errors, axe violations, or missing
+ * interaction states were found (the agent still verifies each).
+ */
+
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } = require("node:fs");
+const { createHash, randomUUID } = require("node:crypto");
+const { basename, join, dirname, isAbsolute, relative, resolve, sep } = require("node:path");
+const { isDeepStrictEqual } = require("node:util");
+const os = require("node:os");
+const { normalizeConfig, recordCompleteness, validateCropRequests, validateReviewEventBatch, validateReviewEvents } = require(join(__dirname, "..", "schemas", "validator.cjs"));
+const { appendReviewRecord, readLog } = require(join(__dirname, "review-record.cjs"));
+const { canonicalPathKey, isSafeTargetId, resolveContainedRealPath, targetManifestFile } = require(join(__dirname, "capture-contract.cjs"));
+const { webCaptureTimeouts } = require(join(__dirname, "web-capture-timeouts.cjs"));
+const { captureProvenance, changedFingerprintReason, fingerprintTarget } = require(join(__dirname, "fingerprint.cjs"));
+const { resolveShellPolicy } = require(join(__dirname, "route-shell-policy.cjs"));
+const { assignAssetIds, produceCrops } = require(join(__dirname, "evidence.cjs"));
+const { buildJudgeContexts } = require(join(__dirname, "judge-context.cjs"));
+const { JUDGE_LOCK_OWNER_ENV, acquireJudgeLock, inheritJudgeLock, releaseJudgeLock } = require(join(__dirname, "judge-lock.cjs"));
+const {
+  acquireLibraryLock,
+  persistReviewCrops,
+  persistRunBundle,
+  readManifestLines,
+  releaseLibraryLock,
+  sealJudgmentState,
+  stateProjectDir,
+} = require(join(__dirname, "library.cjs"));
+
+const SKILL_DIR = dirname(__dirname);
+const RUBRIC = join(SKILL_DIR, "reference", "rubric.md");
+const CAPTURE_OUTCOMES = new Set(["captured", "failed", "skipped"]);
+
+function parseArgs(argv) {
+  const o = {
+    project: null,
+    config: null,
+    targets: null,
+    base: null,
+    out: null,
+    json: false,
+    shots: true,
+    scan: true,
+    record: null,
+    run: null,
+    judgePack: false,
+    previousPack: null,
+    noLibrary: false,
+    cropRequestsPath: null,
+    verifyFresh: false,
+    minConfidence: 0.5,
+    scanScope: "diff",
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--project") o.project = argv[++i];
+    else if (a === "--config") o.config = argv[++i];
+    else if (a === "--targets") o.targets = argv[++i].split(",").map((s) => s.trim());
+    else if (a === "--base") {
+      const base = argv[++i];
+      if (typeof base !== "string" || !base.trim() || base.startsWith("--")) {
+        throw new Error("ui-review: --base <sha> requires a non-empty revision");
+      }
+      o.base = base;
+    }
+    else if (a === "--out") o.out = argv[++i];
+    else if (a === "--record") {
+      o.recordProvided = true;
+      const recordPath = argv[++i];
+      if (typeof recordPath !== "string" || !recordPath.trim() || recordPath.startsWith("--")) {
+        throw new Error("ui-review: --record <events.json> requires a non-empty path");
+      }
+      o.record = recordPath;
+    }
+    else if (a === "--run") {
+      const runPath = argv[++i];
+      if (typeof runPath !== "string" || !runPath.trim() || runPath.startsWith("--")) {
+        throw new Error("ui-review: --run <capture-dir> requires a non-empty path");
+      }
+      o.run = runPath;
+    }
+    else if (a === "--judge-pack") o.judgePack = true;
+    else if (a === "--previous-pack") {
+      const previousPack = argv[++i];
+      if (typeof previousPack !== "string" || !previousPack.trim() || previousPack.startsWith("--")) {
+        throw new Error("ui-review: --previous-pack <manifest.json> requires a non-empty path");
+      }
+      o.previousPack = previousPack;
+    }
+    else if (a === "--json") o.json = true;
+    else if (a === "--no-shots") o.shots = false;
+    else if (a === "--no-scan") o.scan = false;
+    else if (a === "--no-library") o.noLibrary = true;
+    else if (a === "--crop-requests") {
+      const cropRequestsPath = argv[++i];
+      if (typeof cropRequestsPath !== "string" || !cropRequestsPath.trim() || cropRequestsPath.startsWith("--")) {
+        throw new Error("ui-review: --crop-requests <json> requires a non-empty JSON path");
+      }
+      o.cropRequestsPath = cropRequestsPath;
+    }
+    else if (a === "--verify-fresh") o.verifyFresh = true;
+    else if (a === "--scan-scope") {
+      const scope = argv[++i];
+      if (scope !== "diff" && scope !== "targets") {
+        throw new Error("ui-review: --scan-scope must be diff or targets");
+      }
+      o.scanScope = scope;
+    }
+    else if (a === "--min-confidence") o.minConfidence = parseFloat(argv[++i]);
+    else if (a === "--help" || a === "-h") o.help = true;
+  }
+  if (o.recordProvided && !o.run) {
+    throw new Error("ui-review: --record <events.json> requires --run <capture-dir> from a completed capture");
+  }
+  if (o.recordProvided && o.out) {
+    throw new Error("ui-review: --out is a capture option; use --run <capture-dir> to bind --record");
+  }
+  if (o.judgePack && !o.run) {
+    throw new Error("ui-review: --judge-pack requires --run <capture-dir> from a completed capture");
+  }
+  if (o.judgePack && o.recordProvided) {
+    throw new Error("ui-review: --judge-pack and --record are separate operations");
+  }
+  if (o.previousPack && !o.judgePack) {
+    throw new Error("ui-review: --previous-pack is only valid with --judge-pack");
+  }
+  if (o.run && !o.recordProvided && !o.judgePack) {
+    throw new Error("ui-review: --run <capture-dir> is only valid with --record <events.json> or --judge-pack");
+  }
+  if (o.judgePack && o.base !== null) {
+    throw new Error("ui-review: --judge-pack does not support --base");
+  }
+  if (o.judgePack && o.minConfidence !== 0.5) {
+    throw new Error("ui-review: --judge-pack does not support non-default --min-confidence");
+  }
+  if (o.judgePack && (o.out || o.noLibrary || o.cropRequestsPath || !o.shots || !o.scan || o.verifyFresh || o.scanScope !== "diff")) {
+    throw new Error("ui-review: --judge-pack only accepts --project/--config, --run, --targets, --previous-pack, and --json");
+  }
+  if (o.verifyFresh && (o.recordProvided || o.out || o.noLibrary || o.cropRequestsPath || !o.shots || !o.scan || o.scanScope !== "diff")) {
+    throw new Error("ui-review: --verify-fresh only accepts --project/--config, optional --base, --targets, and --json");
+  }
+  return o;
+}
+
+function loadCropRequests(cfg, o) {
+  let cli = [];
+  if (o.cropRequestsPath) {
+    if (!existsSync(o.cropRequestsPath)) throw new Error(`ui-review: crop request file not found: ${o.cropRequestsPath}`);
+    try {
+      const parsed = JSON.parse(readFileSync(o.cropRequestsPath, "utf8"));
+      cli = Array.isArray(parsed) ? parsed : parsed?.cropRequests;
+    } catch (err) {
+      throw new Error(`ui-review: could not parse crop request file: ${err.message}`);
+    }
+  }
+  if (!Array.isArray(cli)) throw new Error("ui-review: crop request JSON must be an array or { cropRequests: [...] }");
+  const requests = [...(cfg.cropRequests || []), ...(cli || [])];
+  const validation = validateCropRequests(requests, "cropRequests");
+  if (!validation.valid) {
+    throw new Error(`ui-review: invalid crop requests:\n${validation.errors.map((error) => `  → ${error}`).join("\n")}`);
+  }
+  return requests;
+}
+
+function loadConfig(o) {
+  const path = o.config
+    ? o.config
+    : o.project
+      ? join(SKILL_DIR, "projects", `${o.project}.json`)
+      : null;
+  if (!path) throw new Error("ui-review: --project <name> or --config <path> required");
+  if (!existsSync(path)) throw new Error(`ui-review: config not found: ${path}`);
+  return normalizeConfig(JSON.parse(readFileSync(path, "utf8")));
+}
+
+function readRecordEvents(path) {
+  if (!path) throw new Error("ui-review: --record <events.json> requires a path");
+  if (!existsSync(path)) throw new Error(`ui-review: record events not found: ${path}`);
+  let events;
+  try {
+    events = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(`ui-review: could not parse record events: ${err.message}`);
+  }
+  const validation = validateReviewEventBatch(events);
+  if (!validation.valid) {
+    throw new Error(`ui-review: invalid review events:\n${validation.errors.map((error) => `  → ${error}`).join("\n")}`);
+  }
+  return events;
+}
+
+function sha256File(path) {
+  return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+}
+
+function isPlainObject(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isUuid(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function hasHashedPngs(assets) {
+  return isPlainObject(assets) && Object.keys(assets).length > 0;
+}
+
+function normalizeTargetShotHashKeys(targetShotHashes, runPath) {
+  return Object.fromEntries(Object.entries(targetShotHashes).map(([targetId, assets]) => {
+    if (!isPlainObject(assets)) return [targetId, assets];
+    const normalized = {};
+    for (const [asset, hash] of Object.entries(assets)) {
+      const canonical = canonicalPathKey(asset);
+      if (Object.prototype.hasOwnProperty.call(normalized, canonical)) {
+        throw new Error(`ui-review: capture run has colliding legacy shot-hash keys for target ${targetId}: ${asset}: ${runPath}`);
+      }
+      normalized[canonical] = hash;
+    }
+    return [targetId, normalized];
+  }));
+}
+
+function captureFailureDescription(run) {
+  const failedTargets = run.targetIds
+    .filter((id) => run.targetOutcomes[id] !== "captured")
+    .map((id) => `${id} (${run.targetOutcomes[id]})`);
+  const emptyHashTargets = run.targetIds.filter((id) => !hasHashedPngs(run.targetShotHashes[id]));
+  return [
+    run.captureFailed === true ? "capture driver reported failure" : null,
+    failedTargets.length ? `failed targets: ${failedTargets.join(", ")}` : null,
+    emptyHashTargets.length ? `targets without hashed PNGs: ${emptyHashTargets.join(", ")}` : null,
+  ].filter(Boolean).join("; ");
+}
+
+function resolveInProject(cfg, p) {
+  return isAbsolute(p) ? p : join(cfg.root, p);
+}
+
+function resolveIntentDoc(cfg, p) {
+  if (p.startsWith("skill:")) return join(SKILL_DIR, p.slice("skill:".length));
+  return resolveInProject(cfg, p);
+}
+
+/**
+ * Resolve a possibly-new path through its nearest existing ancestor. This
+ * catches an output directory whose spelling looks external but whose ancestor
+ * is a symlink into the project.
+ */
+function resolvedPath(path) {
+  const suffix = [];
+  let existing = resolve(path);
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) break;
+    suffix.unshift(basename(existing));
+    existing = parent;
+  }
+  return resolve(realpathSync(existing), ...suffix);
+}
+
+/** The skill never writes bundles or review records into the project it reads. */
+function assertOutsideProject(path, projectRoot, description) {
+  const resolvedProjectRoot = resolvedPath(projectRoot);
+  const resolvedCandidate = resolvedPath(path);
+  const rel = relative(resolvedProjectRoot, resolvedCandidate);
+  if (rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`))) {
+    throw new Error(`${description} is inside project root and is rejected: ${resolvedCandidate}`);
+  }
+}
+
+/**
+ * A completed capture freezes the records that a review event log may claim.
+ * Re-hashing the referenced PNGs at record time makes a modified output
+ * directory fail closed instead of silently weakening that binding.
+ */
+function loadCompletedCaptureRun(runDirInput, cfg) {
+  const runDir = resolve(runDirInput);
+  if (!existsSync(runDir) || !lstatSync(runDir).isDirectory() || lstatSync(runDir).isSymbolicLink()) {
+    throw new Error(`ui-review: capture run directory must be an existing non-symlink directory: ${runDir}`);
+  }
+  assertOutsideProject(runDir, cfg.root, "capture run directory");
+  const runPath = join(runDir, "run.json");
+  if (!existsSync(runPath) || !lstatSync(runPath).isFile() || lstatSync(runPath).isSymbolicLink()) {
+    throw new Error(`ui-review: completed capture run.json not found: ${runPath}`);
+  }
+  let run;
+  try {
+    run = JSON.parse(readFileSync(runPath, "utf8"));
+  } catch (err) {
+    throw new Error(`ui-review: could not parse capture run.json: ${err.message}`);
+  }
+  if (!isPlainObject(run)) throw new Error(`ui-review: capture run must be an object: ${runPath}`);
+  if (!isUuid(run.runId)) throw new Error(`ui-review: capture run has an invalid runId: ${runPath}`);
+  if (run.project !== cfg.name) {
+    throw new Error(`ui-review: capture run project ${run.project} does not match config ${cfg.name}`);
+  }
+  if (!Array.isArray(run.targetIds) || run.targetIds.length === 0 || run.targetIds.some((id) => !isSafeTargetId(id)) || new Set(run.targetIds).size !== run.targetIds.length) {
+    throw new Error(`ui-review: capture run has invalid resolved target ids: ${runPath}`);
+  }
+  if (!isPlainObject(run.targetOutcomes)) {
+    throw new Error(`ui-review: capture run is missing per-target capture outcomes: ${runPath}`);
+  }
+  const targetIds = new Set(run.targetIds);
+  const outcomeTargetIds = Object.keys(run.targetOutcomes);
+  if (outcomeTargetIds.length !== targetIds.size || outcomeTargetIds.some((id) => !targetIds.has(id))) {
+    throw new Error(`ui-review: capture run outcomes do not exactly match resolved targets: ${runPath}`);
+  }
+  for (const targetId of run.targetIds) {
+    if (!CAPTURE_OUTCOMES.has(run.targetOutcomes[targetId])) {
+      throw new Error(`ui-review: capture run has invalid outcome for target ${targetId}: ${runPath}`);
+    }
+  }
+  if (!isPlainObject(run.targetShotHashes)) {
+    throw new Error(`ui-review: capture run is missing per-target shot hashes: ${runPath}`);
+  }
+  const hashTargetIds = Object.keys(run.targetShotHashes);
+  if (hashTargetIds.length !== targetIds.size || hashTargetIds.some((id) => !targetIds.has(id))) {
+    throw new Error(`ui-review: capture run shot-hash targets do not exactly match resolved targets: ${runPath}`);
+  }
+  // Older Windows captures serialized path.relative() keys with backslashes.
+  // Normalize once at the read boundary so all validation, judge-pack, crop,
+  // record-header, and evidence-digest consumers see the canonical key form.
+  run = { ...run, targetShotHashes: normalizeTargetShotHashKeys(run.targetShotHashes, runPath) };
+  const captureFailure = captureFailureDescription(run);
+  if (run.captureComplete !== true) {
+    throw new Error(
+      `ui-review: --run must name a completed capture (captureComplete: true)` +
+        `${captureFailure ? `; ${captureFailure}` : ""}: ${runDir}`,
+    );
+  }
+  if (captureFailure) {
+    throw new Error(`ui-review: capture run claims complete but ${captureFailure}: ${runPath}`);
+  }
+  const shotsDir = join(runDir, "shots");
+  const captureManifestPath = join(shotsDir, "manifest.json");
+  if (!existsSync(captureManifestPath) || !lstatSync(captureManifestPath).isFile() || lstatSync(captureManifestPath).isSymbolicLink()) {
+    throw new Error(`ui-review: capture manifest is missing or unsafe: ${captureManifestPath}`);
+  }
+  let captureManifest;
+  try {
+    captureManifest = JSON.parse(readFileSync(captureManifestPath, "utf8"));
+  } catch (err) {
+    throw new Error(`ui-review: could not parse capture manifest: ${err.message}`);
+  }
+  if (!isPlainObject(captureManifest) || !Array.isArray(captureManifest.targets)) {
+    throw new Error(`ui-review: capture manifest targets are invalid: ${captureManifestPath}`);
+  }
+  const manifestTargets = new Map();
+  for (const target of captureManifest.targets) {
+    if (!isPlainObject(target) || !isSafeTargetId(target.id) || manifestTargets.has(target.id)) {
+      throw new Error(`ui-review: capture manifest has invalid or duplicate target entries: ${captureManifestPath}`);
+    }
+    manifestTargets.set(target.id, target);
+  }
+  const extraManifestTargetIds = [...manifestTargets.keys()].filter((targetId) => !targetIds.has(targetId)).sort();
+  if (extraManifestTargetIds.length) {
+    throw new Error(
+      `ui-review: capture manifest targets do not exactly match resolved targets; ` +
+        `extra targets: ${extraManifestTargetIds.join(", ")}: ${captureManifestPath}`,
+    );
+  }
+  for (const targetId of run.targetIds) {
+    const assets = run.targetShotHashes[targetId];
+    if (!isPlainObject(assets)) {
+      throw new Error(`ui-review: capture run has invalid shot hashes for target ${targetId}: ${runPath}`);
+    }
+    const manifestTarget = manifestTargets.get(targetId);
+    if (!manifestTarget) {
+      throw new Error(`ui-review: capture manifest is missing target ${targetId}: ${captureManifestPath}`);
+    }
+    const expectedAssets = new Set(
+      [
+        ...(manifestTarget.shots || []).map((shot) => shot?.path),
+        ...(manifestTarget.interactions || []).map((interaction) => interaction?.statePath),
+      ]
+        .filter(Boolean)
+        .map((assetPath) => {
+          let resolved;
+          try {
+            ({ absolute: resolved } = resolveContainedRealPath(shotsDir, assetPath, { rejectSymlinkComponents: true }));
+          } catch (err) {
+            throw new Error(`ui-review: capture manifest has an unsafe shot path for target ${targetId}: ${assetPath} (${err.message})`);
+          }
+          const asset = relative(shotsDir, resolved);
+          if (!asset || isAbsolute(asset) || asset === ".." || asset.startsWith(`..${sep}`) || !asset.toLowerCase().endsWith(".png")) {
+            throw new Error(`ui-review: capture manifest has an unsafe shot path for target ${targetId}: ${assetPath}`);
+          }
+          return canonicalPathKey(asset);
+        }),
+    );
+    const hashedAssets = new Set(Object.keys(assets));
+    if (expectedAssets.size !== hashedAssets.size || [...expectedAssets].some((asset) => !hashedAssets.has(asset))) {
+      throw new Error(`ui-review: capture run shot-hash keys must exactly match capture manifest assets for target ${targetId}`);
+    }
+    for (const [asset, hash] of Object.entries(assets)) {
+      let assetPath;
+      try {
+        ({ absolute: assetPath } = resolveContainedRealPath(shotsDir, asset, { rejectSymlinkComponents: true }));
+      } catch (err) {
+        throw new Error(`ui-review: capture run has an unsafe shot path for target ${targetId}: ${asset} (${err.message})`);
+      }
+      const assetRelative = relative(shotsDir, assetPath);
+      if (!asset || isAbsolute(assetRelative) || assetRelative === ".." || assetRelative.startsWith(`..${sep}`) || !assetRelative.toLowerCase().endsWith(".png")) {
+        throw new Error(`ui-review: capture run has an unsafe shot path for target ${targetId}: ${asset}`);
+      }
+      if (!existsSync(assetPath) || !lstatSync(assetPath).isFile() || lstatSync(assetPath).isSymbolicLink()) {
+        throw new Error(`ui-review: captured shot is missing or unsafe for target ${targetId}: ${asset}`);
+      }
+      if (typeof hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(hash) || sha256File(assetPath) !== hash) {
+        throw new Error(`ui-review: captured shot hash no longer matches run identity for target ${targetId}: ${asset}`);
+      }
+    }
+  }
+  return { runDir, runPath, run, shotsDir, captureManifest };
+}
+
+/**
+ * A capture run owns its output directory. Reusing one could leave a
+ * symlinked run.json, bundle.json, or shots directory for a later write to
+ * follow, so create the final directory exactly once and reject all reuse.
+ */
+function createFreshOutputDir(outDir, projectRoot) {
+  const path = resolve(outDir);
+  assertOutsideProject(path, projectRoot, "output path");
+  if (existsSync(path)) {
+    throw new Error(`output directory already exists and is rejected: ${path}`);
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  assertOutsideProject(path, projectRoot, "output path");
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (err) {
+    if (err.code === "EEXIST") {
+      throw new Error(`output directory already exists and is rejected: ${path}`);
+    }
+    throw err;
+  }
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`output path must be a newly created directory: ${path}`);
+  }
+  assertOutsideProject(path, projectRoot, "output path");
+  return path;
+}
+
+async function serverUp(baseUrl) {
+  try {
+    const res = await fetch(baseUrl, { signal: AbortSignal.timeout(3000) });
+    return res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+const CAPTURE_MODES = new Set(["playwright", "rn-sim"]);
+
+/**
+ * Which capture backend this project uses. An absent `capture` block means the
+ * original web behaviour, so every pre-existing config keeps working untouched.
+ */
+function captureMode(cfg) {
+  const mode = cfg.capture?.mode ?? "playwright";
+  if (!CAPTURE_MODES.has(mode)) {
+    throw new Error(
+      `unknown capture.mode "${mode}" (expected ${[...CAPTURE_MODES].join(" or ")})`,
+    );
+  }
+  return mode;
+}
+
+function runScan(cfg, o, selectedTargets = []) {
+  const args = [
+    join(SKILL_DIR, "scripts", "ui-scan"),
+    "--root",
+    cfg.root,
+    "--json",
+    "--min-confidence",
+    String(o.minConfidence),
+  ];
+  if (cfg.tokensCss) args.push("--globals", cfg.tokensCss);
+  if (cfg.designSystemIndex) args.push("--barrel", cfg.designSystemIndex);
+  if (cfg.scan?.ruleset) args.push("--ruleset", cfg.scan.ruleset);
+  // In target scope, selected targets' declared sourceFiles are the authority.
+  // Applying include after explicit target selection can silently omit a target.
+  if (cfg.scan?.include?.length && o.scanScope !== "targets") {
+    args.push("--include", cfg.scan.include.join(","));
+  }
+  if (cfg.scan?.tokensDir) args.push("--tokens-dir", cfg.scan.tokensDir);
+  if (cfg.scan?.componentsDoc) args.push("--components-doc", cfg.scan.componentsDoc);
+  for (const barrel of cfg.scan?.barrels || []) args.push("--barrel", barrel);
+  if (cfg.scan?.ignoreRules?.length) args.push("--ignore-rules", cfg.scan.ignoreRules.join(","));
+  if (o.base) args.push("--base", o.base);
+  if (o.scanScope === "targets") {
+    const sourceFiles = [...new Set(selectedTargets.flatMap((target) => target.sourceFiles || []))];
+    args.push("--files", sourceFiles.join(","));
+  }
+  const targetErrors = o.scanScope === "targets"
+    ? selectedTargets.flatMap((target) => {
+      const declared = Array.isArray(target.sourceFiles) ? target.sourceFiles : [];
+      if (!declared.length) {
+        return [{
+          targetId: target.id,
+          sourceFiles: [],
+          error: "target has no declared sourceFiles",
+        }];
+      }
+      const unavailable = declared.filter((file) => {
+        const path = isAbsolute(file) ? file : join(cfg.root, file);
+        try {
+          return !statSync(path).isFile();
+        } catch {
+          return true;
+        }
+      });
+      return unavailable.length
+        ? [{
+          targetId: target.id,
+          sourceFiles: unavailable,
+          error: `declared sourceFiles are unavailable: ${unavailable.join(", ")}`,
+        }]
+        : [];
+    })
+    : [];
+  const r = spawnSync(process.execPath, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (!r.stdout) {
+    return {
+      error: (r.stderr || "ui-scan produced no output").trim(),
+      findings: [],
+      summary: { findings: 0, byRule: {} },
+      targetErrors,
+    };
+  }
+  const report = JSON.parse(r.stdout);
+  const scannedFiles = new Set(report.summary?.scannedFiles || []);
+  const policyTargets = o.scanScope === "targets"
+    ? selectedTargets
+    : selectedTargets.filter((target) => (target.sourceFiles || []).some((file) => scannedFiles.has(file)));
+  report.scope = o.scanScope;
+  report.targetErrors = targetErrors;
+  report.shellPolicy = resolveShellPolicy({
+    root: cfg.root,
+    targets: policyTargets,
+    allTargets: cfg.routes,
+    barrels: cfg.scan?.barrels || [],
+    shellPolicy: cfg.scan?.shellPolicy || [],
+  });
+  return report;
+}
+
+/**
+ * Runtime tools the selected backend needs, as [{ name, hint }]. Playwright's
+ * deps are skill-local npm packages; the rn-sim backend's are external CLIs, so
+ * the two produce different install hints.
+ */
+function missingRuntimeDeps(mode) {
+  if (mode === "rn-sim") {
+    const { commandAvailable } = require(join(SKILL_DIR, "scripts", "sim-target.cjs"));
+    return [
+      {
+        name: "xcrun simctl",
+        probe: ["xcrun", ["simctl", "help"]],
+        hint: "Install Xcode and its command line tools (`xcode-select --install`).",
+      },
+      {
+        name: "axe (AXe simulator automation)",
+        probe: ["axe", ["--version"]],
+        hint: "Install AXe: `brew tap cameroncooke/axe && brew install axe`.",
+      },
+    ]
+      .filter((dep) => !commandAvailable(dep.probe[0], dep.probe[1]))
+      .map(({ name, hint }) => ({ name, hint }));
+  }
+  return ["@playwright/test", "@axe-core/playwright"]
+    .filter((pkg) => {
+      try {
+        require.resolve(pkg, { paths: [SKILL_DIR] });
+        return false;
+      } catch {
+        return true;
+      }
+    })
+    .map((name) => ({ name, hint: `Run \`npm run bootstrap\` in ${SKILL_DIR}.` }));
+}
+
+/**
+ * rn-sim precondition: a simulator matching the config is booted and carries
+ * the app. Returns null when ready, else a message + remediation hints.
+ */
+function simReady(cfg) {
+  const { resolveSimulator, appInstalled } = require(join(SKILL_DIR, "scripts", "sim-target.cjs"));
+  let sim;
+  try {
+    sim = resolveSimulator(cfg.capture);
+  } catch (err) {
+    return { error: err.message, hints: [] };
+  }
+  const bundleId = cfg.capture?.bundleId;
+  if (!bundleId) return { error: "capture.bundleId is required for capture.mode rn-sim", hints: [] };
+  if (!appInstalled(sim.udid, bundleId)) {
+    return {
+      error: `${bundleId} is not installed on ${sim.name} (${sim.udid})`,
+      hints: [
+        "Build and install the app on that simulator first (for Expo: `npm --prefix apps/mobile run ios`).",
+      ],
+    };
+  }
+  return null;
+}
+
+/**
+ * Project-owned session bootstrap is external to this skill. The RN backend
+ * proves the configured marker through AXe before spawning its first capture;
+ * a web backend intentionally treats the same shape as a no-op for now.
+ */
+async function sessionReady(cfg, mode) {
+  const session = cfg.capture?.session;
+  if (!session || mode !== "rn-sim") return null;
+  const { assertCaptureSession, resolveSimulator } = require(join(SKILL_DIR, "scripts", "sim-target.cjs"));
+  try {
+    const sim = resolveSimulator(cfg.capture);
+    await assertCaptureSession(cfg.capture, sim);
+    return null;
+  } catch (err) {
+    return { error: err.message, bootstrapHint: session.bootstrapHint };
+  }
+}
+
+/**
+ * Reject route/interaction shapes that the rn-sim backend cannot honour, before
+ * spawning the driver. These are semantic impossibilities on iOS, not gaps:
+ * there is no pointer hover and no DOM focus ring to screenshot, and an app has
+ * one signed-in identity so per-target role switching has no meaning.
+ */
+function validateRnTargets(targets) {
+  const errors = [];
+  const alternatives = { hover: "tap", focus: "tap", active: "tap", click: "tap" };
+  for (const target of targets) {
+    if (target.role) {
+      errors.push(
+        `target "${target.id}": \`role\` is not supported by capture.mode rn-sim ` +
+          "(the app has a single signed-in session; use the auth block instead)",
+      );
+    }
+    for (const interaction of target.interactions ?? []) {
+      const action = interaction.action;
+      if (action === "tap" || action === "fill") continue;
+      const alt = alternatives[action];
+      errors.push(
+        `target "${target.id}" interaction "${interaction.id}": action "${action}" ` +
+          (alt
+            ? `has no iOS equivalent (no pointer hover, no DOM focus ring) — use "${alt}"`
+            : 'is unsupported (supported: "tap", "fill")'),
+      );
+    }
+  }
+  return errors;
+}
+
+/** Resolve --targets against the config's routes: { targets } or { error }. */
+function selectTargets(cfg, o) {
+  const routes = cfg.routes || [];
+  const byId = new Map(routes.map((route) => [route.id, route]));
+  let targets = routes;
+  if (o.targets) {
+    const selectedIds = [];
+    const missing = [];
+    for (const selector of o.targets) {
+      const hasGroup = cfg.groups != null && Object.prototype.hasOwnProperty.call(cfg.groups, selector);
+      if (hasGroup) {
+        const group = cfg.groups[selector];
+        selectedIds.push(...group);
+      } else if (byId.has(selector)) {
+        selectedIds.push(selector);
+      } else {
+        missing.push(selector);
+      }
+    }
+    if (missing.length) return { error: `unknown target id(s): ${missing.join(", ")}` };
+    targets = [...new Set(selectedIds)].map((id) => byId.get(id));
+  }
+  if (targets.length === 0) {
+    return {
+      error: o.targets
+        ? `no routes match --targets ${o.targets.join(",")}`
+        : "config has no routes",
+    };
+  }
+  return { targets };
+}
+
+/** Add Pass 0's outcome contract without pretending later evidence exists. */
+function applyTargetOutcomes(manifest, selectedTargets) {
+  const byId = new Map((manifest.targets || []).map((target) => [target.id, target]));
+  const targets = selectedTargets.map((selected) => {
+    const target = byId.get(selected.id);
+    if (!target) {
+      return {
+        id: selected.id,
+        route: selected.route,
+        shots: [],
+        interactions: [],
+        axe: null,
+        errors: ["driver produced no target manifest"],
+        outcome: "failed",
+        reason: "driver produced no target manifest",
+      };
+    }
+    const errors = Array.isArray(target.errors) ? target.errors : [];
+    // A configured interaction is a required capture assertion. Drivers
+    // represent a missing selector/bounding box and an unchanged state as a
+    // false `changed` result, rather than necessarily adding target.errors.
+    const failedInteractions = (target.interactions || []).filter((interaction) => interaction.changed === false);
+    target.errors = errors;
+    const failedInteractionReason = failedInteractions.length
+      ? `required interaction${failedInteractions.length === 1 ? "" : "s"} failed: ` +
+        failedInteractions
+          .map((interaction) => `${interaction.id}${interaction.note ? ` (${interaction.note})` : " (no visible state change)"}`)
+          .join("; ")
+      : null;
+    if (errors.length || failedInteractionReason) {
+      target.outcome = "failed";
+      target.reason = [errors.join("; "), failedInteractionReason].filter(Boolean).join("; ");
+    } else if (!target.shots?.length) {
+      target.outcome = "skipped";
+      target.reason = "driver produced no screenshot assets";
+    } else {
+      target.outcome = "captured";
+      target.reason = null;
+    }
+    return target;
+  });
+  manifest.targets = targets;
+  return manifest;
+}
+
+/**
+ * Finalize the capture identity only after the driver has emitted its manifest.
+ * Keys are paths relative to shots/ so the immutable run is portable as a
+ * directory while still naming every concrete PNG that was reviewed.
+ */
+function finalizeCaptureRun(runPath, run, manifest, shotsOut) {
+  const targetShotHashes = Object.fromEntries(run.targetIds.map((id) => [id, {}]));
+  const manifestTargets = new Map((manifest.targets || []).map((target) => [target.id, target]));
+  const targetOutcomes = Object.fromEntries(
+    run.targetIds.map((id) => {
+      const outcome = manifestTargets.get(id)?.outcome;
+      return [id, CAPTURE_OUTCOMES.has(outcome) ? outcome : "failed"];
+    }),
+  );
+  const shotsRoot = resolve(shotsOut);
+  for (const target of manifest.targets || []) {
+    if (!Object.prototype.hasOwnProperty.call(targetShotHashes, target.id)) continue;
+    const paths = [
+      ...(target.shots || []).map((shot) => shot.path),
+      ...(target.interactions || []).map((interaction) => interaction.statePath),
+    ].filter(Boolean);
+    for (const shotPath of paths) {
+      const resolvedShotPath = resolve(shotPath);
+      const asset = relative(shotsRoot, resolvedShotPath);
+      if (isAbsolute(asset) || asset === ".." || asset.startsWith(`..${sep}`) || !asset.toLowerCase().endsWith(".png")) {
+        throw new Error(`ui-review: driver emitted an unsafe shot path for target ${target.id}: ${shotPath}`);
+      }
+      if (!existsSync(resolvedShotPath) || !lstatSync(resolvedShotPath).isFile() || lstatSync(resolvedShotPath).isSymbolicLink()) {
+        throw new Error(`ui-review: driver emitted a missing or unsafe shot for target ${target.id}: ${shotPath}`);
+      }
+      targetShotHashes[target.id][canonicalPathKey(asset)] = sha256File(resolvedShotPath);
+    }
+  }
+  const completedRun = {
+    ...run,
+    targetOutcomes,
+    targetShotHashes,
+    captureFailed: manifest.captureFailed === true,
+    captureComplete:
+      manifest.captureFailed !== true &&
+      run.targetIds.every((id) => targetOutcomes[id] === "captured" && hasHashedPngs(targetShotHashes[id])),
+    completedAt: new Date().toISOString(),
+  };
+  // The manifest is part of the immutable run binding. Finalization always
+  // writes the normalized outcome-bearing version so direct callers cannot
+  // accidentally leave run.json with no capture-manifest counterpart.
+  writeFileSync(join(shotsOut, "manifest.json"), JSON.stringify(manifest, null, 2));
+  for (const target of manifest.targets || []) {
+    if (isSafeTargetId(target.id)) {
+      writeFileSync(targetManifestFile(shotsOut, target.id), JSON.stringify(target, null, 2));
+    }
+  }
+  writeFileSync(runPath, JSON.stringify(completedRun, null, 2));
+  return completedRun;
+}
+
+function runShots(cfg, outDir, mode, targets, cropRequests = []) {
+  const shotsOut = join(outDir, "shots");
+  const evidenceCfg = cropRequests === cfg.cropRequests
+    ? cfg
+    : { ...cfg, cropRequests };
+  const run = {
+    runId: randomUUID(),
+    project: cfg.name,
+    targetIds: targets.map((target) => target.id),
+    root: cfg.root,
+    baseUrl: cfg.baseUrl,
+    outDir: shotsOut,
+    settleMs: cfg.settleMs ?? 350,
+    viewports: cfg.viewports,
+    auth: cfg.auth,
+    targets,
+    cropRequests,
+    scrollProbe: cfg.capture?.scrollProbe,
+    // Resolved (defaults applied) so the run records the waits it ran with.
+    // Config validation rejects these keys under rn-sim, which has no page
+    // navigation and bounds each waitFor with the target's own timeoutMs.
+    ...(mode === "playwright" ? webCaptureTimeouts(cfg.capture) : {}),
+    targetFingerprints: Object.fromEntries(
+      targets.map((target) => [target.id, fingerprintTarget(evidenceCfg, target)]),
+    ),
+  };
+  if (mode === "rn-sim") run.capture = cfg.capture;
+  const runPath = join(outDir, "run.json");
+  writeFileSync(runPath, JSON.stringify(run, null, 2));
+  const driver = mode === "rn-sim" ? "shoot-rn.mjs" : "shoot.mjs";
+  const r = spawnSync(process.execPath, [join(SKILL_DIR, "scripts", driver), "--run", runPath], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  const manifestPath = join(shotsOut, "manifest.json");
+  if (!existsSync(manifestPath)) {
+    // Drivers can reject their run contract before creating shots/. Preserve
+    // the failed-target capture record instead of turning that driver failure
+    // into an ENOENT from fallback finalization.
+    mkdirSync(shotsOut, { recursive: true });
+    const manifest = {
+      error: "shoot produced no manifest",
+      captureFailed: true,
+      captureStatus: r.status,
+      captureSignal: r.signal,
+      targets: targets.map((target) => ({
+        id: target.id,
+        route: target.route,
+        shots: [],
+        interactions: [],
+        axe: null,
+        errors: ["shoot produced no manifest"],
+        outcome: "failed",
+        reason: "shoot produced no manifest",
+      })),
+    };
+    finalizeCaptureRun(runPath, run, manifest, shotsOut);
+    return manifest;
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  if (r.status !== 0 || r.signal || r.error) {
+    manifest.captureFailed = true;
+    manifest.captureStatus = r.status;
+    manifest.captureSignal = r.signal;
+    if (r.error) manifest.captureError = r.error.message;
+  }
+  assignAssetIds(manifest, cfg);
+  const crops = produceCrops({ captureManifest: manifest, cfg, shotsDir: shotsOut, cropRequests });
+  if (crops.errors.length) {
+    manifest.captureEvidenceErrors = crops.errors;
+    manifest.captureFailed = true;
+  }
+  applyTargetOutcomes(manifest, targets);
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  finalizeCaptureRun(runPath, run, manifest, shotsOut);
+  return manifest;
+}
+
+function defaultOutDir(projectName) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(os.tmpdir(), "autoreview-ui", projectName, `${stamp}-${process.pid}`);
+}
+
+function summarize(bundle) {
+  const lines = [];
+  const scan = bundle.scan;
+  if (scan && !scan.error) {
+    const n = scan.summary?.findings ?? 0;
+    lines.push(`SCAN  ${n} laziness tell(s)` + (n ? `: ${JSON.stringify(scan.summary.byRule)}` : " (clean)"));
+    const ignored = scan.summary?.ignoredByRule || {};
+    if (Object.keys(ignored).length) {
+      // Never silent: name every rule the project config switched off and the
+      // hits it would have reported, so a stale or over-broad ignore shows up.
+      lines.push(`SCAN  ignored by config (scan.ignoreRules), not counted: ${JSON.stringify(ignored)}`);
+    }
+    for (const targetError of scan.targetErrors || []) {
+      lines.push(`SCAN target ${targetError.targetId}: error — ${targetError.error}`);
+    }
+    for (const policy of scan.shellPolicy || []) {
+      const label = `SHELL ${policy.targetId} (${policy.routeClass})`;
+      if (policy.verdict === "violated") {
+        lines.push(
+          `${label}: violated — missing one of ${policy.missing.join(", ")} at ${policy.file}:${policy.line}`,
+        );
+      } else if (policy.verdict === "unresolved") {
+        lines.push(`${label}: unresolved — ${policy.reason} at ${policy.file || "unknown"}:${policy.line || 1}`);
+      } else if (policy.verdict === "exempt") {
+        lines.push(`${label}: exempt — ${policy.reason}`);
+      } else {
+        lines.push(`${label}: satisfied — ${policy.component} at ${policy.file}:${policy.line}`);
+      }
+    }
+  } else if (scan?.error) {
+    lines.push(`SCAN  skipped/error: ${scan.error}`);
+    for (const targetError of scan.targetErrors || []) {
+      lines.push(`SCAN target ${targetError.targetId}: error — ${targetError.error}`);
+    }
+  }
+
+  const shots = bundle.shots;
+  if (shots) {
+    if (shots.error) lines.push(`SHOT  skipped/error: ${shots.error}`);
+    if (shots.captureFailed) {
+      const status = shots.captureStatus == null ? "unknown" : shots.captureStatus;
+      const signal = shots.captureSignal ? ` signal=${shots.captureSignal}` : "";
+      lines.push(`SHOT  capture failed: status=${status}${signal}`);
+    }
+    for (const t of shots.targets || []) {
+      const axe = t.axe?.violations?.length || 0;
+      const axeByImpact = {};
+      for (const v of t.axe?.violations || []) axeByImpact[v.impact || "n/a"] = (axeByImpact[v.impact || "n/a"] || 0) + 1;
+      const missing = (t.interactions || []).filter((i) => i.changed === false && !i.note);
+      const notFound = (t.interactions || []).filter((i) => i.note === "selector not found");
+      const failed = (t.interactions || []).filter(
+        (i) => i.changed === false && i.note && i.note !== "selector not found",
+      );
+      lines.push(
+        `SHOT  ${t.id} (${t.route}${t.role ? " as " + t.role : ""}): ` +
+          `${t.shots.length} shot(s), axe ${axe}${axe ? " " + JSON.stringify(axeByImpact) : ""}` +
+          `${missing.length ? `, MISSING-STATE ${missing.map((m) => m.id).join("/")}` : ""}` +
+          `${notFound.length ? `, bad-selector ${notFound.map((m) => m.id).join("/")}` : ""}` +
+          `${failed.length ? `, failed-interaction ${failed.map((m) => m.id).join("/")}` : ""}` +
+          `${t.errors.length ? `, errors: ${t.errors.join("; ")}` : ""}` +
+          `, ${t.outcome || "unknown"}${t.reason ? ` (${t.reason})` : ""}`,
+      );
+      if (t.scroll) {
+        const facts = t.scroll;
+        const geometry = facts.scrollExtentPt == null || facts.viewportPt == null
+          ? "geometry unavailable; layout-economy not-judged"
+          : `extent ${facts.scrollExtentPt}pt / viewport ${facts.viewportPt}pt`;
+        lines.push(
+          `SCROLL ${t.id}: ${facts.scrollable === null ? "not-detected" : facts.scrollable ? "scrollable" : "not-scrollable"}, ` +
+          `${geometry}, bottomReached ${facts.bottomReached === null ? "not-judged" : facts.bottomReached}` +
+          `${facts.inert ? ", inert" : ""}` +
+          `${facts.sliverScroll === "suspected" ? ", sliver-scroll suspected" : facts.sliverScroll ? ", sliver-scroll" : ""}`,
+        );
+      }
+    }
+  }
+  if (bundle.review) {
+    const review = bundle.review;
+    lines.push(
+      review.complete
+        ? `REVIEW complete: ${review.dispositions} disposition(s)`
+        : `REVIEW ${review.status || "incomplete"}: ${review.reason || "no review record written"}`,
+    );
+  }
+  if (bundle.library?.mode === "persistent") {
+    lines.push(`LIBRARY persisted: ${bundle.library.runDir} (${bundle.library.records} manifest record(s))`);
+    if (bundle.library.retention?.quotaExceeded) {
+      lines.push("LIBRARY retention quota exceeded by the retained current run");
+    }
+  } else if (bundle.library?.mode === "ephemeral") {
+    lines.push("LIBRARY ephemeral (--no-library; excluded from manifest.jsonl)");
+  }
+  return lines.join("\n");
+}
+
+function latestTargetManifestRecord(records, targetId) {
+  const own = records.filter((record) => record?.targetId === targetId);
+  const targetSummary = [...own].reverse().find((record) => record.recordType === "target");
+  if (targetSummary) return targetSummary;
+  // Compatibility with early libraries that contained only one line per asset.
+  return [...own].reverse().find((record) => record.outcome === "captured") ?? null;
+}
+
+function verifyFreshTargets(cfg, targets, base, { stateDir } = {}) {
+  const records = readManifestLines(cfg.name, stateDir);
+  return targets.map((target) => {
+    const current = fingerprintTarget(cfg, target, { base });
+    if (!current.fingerprint) {
+      return { targetId: target.id, status: "unverifiable", reason: current.reason, fingerprint: null };
+    }
+    const previous = latestTargetManifestRecord(records, target.id);
+    if (!previous || previous.outcome !== "captured" || !previous.targetFingerprint) {
+      return {
+        targetId: target.id,
+        status: "never-captured",
+        reason: previous ? `latest library outcome is ${previous.outcome}` : "no library capture exists",
+        fingerprint: current.fingerprint,
+      };
+    }
+    if (previous.targetFingerprint === current.fingerprint) {
+      return { targetId: target.id, status: "fresh", reason: "fingerprint matches latest captured library entry", fingerprint: current.fingerprint };
+    }
+    return {
+      targetId: target.id,
+      status: "stale",
+      reason: changedFingerprintReason(previous.fingerprintInputs, current.inputs),
+      fingerprint: current.fingerprint,
+      previousFingerprint: previous.targetFingerprint,
+    };
+  });
+}
+
+function actionable(bundle) {
+  const scanN = bundle.scan?.summary?.findings || 0;
+  const scanErrorN = bundle.scan?.error ? 1 : 0;
+  const targetErrorN = bundle.scan?.targetErrors?.length || 0;
+  const shellPolicyN = (bundle.scan?.shellPolicy || []).filter(
+    (policy) => policy.verdict === "violated" || policy.verdict === "unresolved",
+  ).length;
+  const intentN = bundle.intentResolved ? 0 : 1;
+  const captureN = bundle.shots?.error || bundle.shots?.captureFailed ? 1 : 0;
+  let axeN = 0;
+  let missingN = 0;
+  let shotErrorN = 0;
+  let failedInteractionN = 0;
+  for (const t of bundle.shots?.targets || []) {
+    axeN += t.axe?.violations?.length || 0;
+    missingN += (t.interactions || []).filter((i) => i.changed === false && !i.note).length;
+    shotErrorN += t.errors?.length || 0;
+    failedInteractionN += (t.interactions || []).filter((i) => i.changed === false && i.note).length;
+  }
+  return scanN + scanErrorN + targetErrorN + shellPolicyN + intentN + captureN + axeN + missingN + shotErrorN + failedInteractionN > 0;
+}
+
+function targetJudgmentDisposition(events, targetId) {
+  const dispositions = events
+    .filter((event) => event.kind === "disposition" && event.finding?.targetId === targetId)
+    .map((event) => event.finding.disposition);
+  if (!dispositions.length) return "clean";
+  if (dispositions.includes("not-judged")) return "not-judged";
+  if (dispositions.includes("accepted")) return "accepted";
+  return "rejected";
+}
+
+function targetFingerprint(run, targetId) {
+  const entry = run.targetFingerprints?.[targetId];
+  return typeof entry === "string" ? entry : entry?.fingerprint ?? null;
+}
+
+function recordEventsAlreadyCommitted(inputEvents, committedEvents) {
+  const committedById = new Map(
+    committedEvents
+      .filter((event) => typeof event?.eventId === "string")
+      .map((event) => [event.eventId, event]),
+  );
+  const replayed = inputEvents.slice(1);
+  return replayed.length > 0 && replayed.every((event) =>
+    typeof event?.eventId === "string" && isDeepStrictEqual(committedById.get(event.eventId), event),
+  );
+}
+
+function persistedJudgmentEvidenceForRecord(persistedPack, targetIds, runDir) {
+  if (!persistedPack) return null;
+  const evidence = persistedPack.pack.targetJudgmentEvidence;
+  const missingTargetIds = targetIds.filter((targetId) => !evidence?.[targetId]);
+  if (missingTargetIds.length) {
+    throw new Error(
+      `legacy judge pack is missing target judgment evidence for target(s): ${missingTargetIds.join(", ")}; ` +
+      `rebuild the judge pack with ui-review --judge-pack --run ${runDir} before retrying --record`,
+    );
+  }
+  return evidence;
+}
+
+function judgmentEvidenceForCapture({ cfg, captureRun, targetIds, persistedPack, libraryLease }) {
+  if (persistedPack) {
+    return persistedJudgmentEvidenceForRecord(persistedPack, targetIds, captureRun.runDir);
+  }
+  const { targetJudgmentEvidence } = require(join(__dirname, "judge-pack.cjs"));
+  const bundlePath = join(captureRun.runDir, "bundle.json");
+  const bundle = existsSync(bundlePath)
+    ? JSON.parse(readFileSync(bundlePath, "utf8"))
+    : { judgeContext: {} };
+  return targetJudgmentEvidence({
+    cfg,
+    run: captureRun.run,
+    captureManifest: captureRun.captureManifest,
+    shotsDir: captureRun.shotsDir,
+    bundle,
+    targetIds,
+    exemplars: undefined,
+    stateDir: undefined,
+    libraryLease,
+  }).evidenceByTarget;
+}
+
+function sealedTargetsForReview({ captureRun, events, targetIds, sealedEvidence }) {
+  return targetIds.map((targetId) => {
+    if (!sealedEvidence?.[targetId]) {
+      throw new Error(`ui-review: target ${targetId} has no judgment evidence for committed review finalization`);
+    }
+    return {
+      targetId,
+      fingerprint: targetFingerprint(captureRun.run, targetId),
+      baseEvidenceDigest: sealedEvidence[targetId].baseEvidenceDigest,
+      evidenceDigest: sealedEvidence[targetId].evidenceDigest,
+      rubricDigest: sealedEvidence[targetId].rubricDigest,
+      promptDigests: sealedEvidence[targetId].promptDigests,
+      runId: captureRun.run.runId,
+      disposition: targetJudgmentDisposition(events, targetId),
+    };
+  });
+}
+
+/**
+ * Rebuild every post-commit judgment transition from durable sources. The
+ * sealed review log supplies targets and dispositions; the validated pack (or
+ * the same deterministic capture derivation used before commit) supplies the
+ * evidence digests. Both destinations are content-idempotent.
+ */
+function finalizeCommittedReview({ cfg, captureRun, reviewPath, libraryLease, judgeLock, expectedFinalization = null }) {
+  const expectedReviewPath = join(libraryLease.projectDir, "runs", captureRun.run.runId, "review.json");
+  if (realpathSync(reviewPath) !== realpathSync(expectedReviewPath)) {
+    throw new Error(`ui-review: finalization requires the durable review log at ${expectedReviewPath}`);
+  }
+  const committedEvents = readLog(reviewPath);
+  if (!committedEvents.length) throw new Error(`ui-review: committed review log is empty: ${reviewPath}`);
+  const committedHeader = committedEvents[0];
+  const validationHeader = committedHeader.targetShotHashes === undefined
+    ? committedHeader
+    : {
+        ...committedHeader,
+        targetShotHashes: normalizeTargetShotHashKeys(committedHeader.targetShotHashes, reviewPath),
+      };
+  const validationEvents = [validationHeader, ...committedEvents.slice(1)];
+  const validation = validateReviewEvents(validationEvents, {
+    targetIds: cfg.routes.map((route) => route.id),
+    capturedTargetIds: captureRun.run.targetIds,
+    capturedTargetOutcomes: captureRun.run.targetOutcomes,
+    capturedTargetShotHashes: captureRun.run.targetShotHashes,
+  });
+  if (!validation.valid) {
+    throw new Error(`ui-review: refusing to finalize invalid committed review events:\n${validation.errors.map((error) => `  - ${error}`).join("\n")}`);
+  }
+  const completeness = recordCompleteness(validationEvents);
+  if (!completeness.complete) {
+    throw new Error(`ui-review: committed review log is not complete and cannot advance judgment state: ${reviewPath}`);
+  }
+  if (committedHeader.project !== cfg.name || committedHeader.runId !== captureRun.run.runId) {
+    throw new Error(`ui-review: committed review log does not belong to capture run ${captureRun.run.runId}`);
+  }
+
+  const { assertPersistedJudgePackMatchesCapture, updateJudgePackJudgments } = require(join(__dirname, "judge-pack.cjs"));
+  const persistedPack = assertPersistedJudgePackMatchesCapture(
+    captureRun.runDir,
+    captureRun.run,
+    committedHeader.targets,
+    captureRun.captureManifest,
+  );
+  let sealedTargets;
+  if (expectedFinalization) {
+    const currentPackId = persistedPack?.pack.packId ?? null;
+    if (expectedFinalization.packId !== currentPackId) {
+      throw new Error(
+        `ui-review: committed review recovery expected executed pack ${expectedFinalization.packId ?? "(none)"}, ` +
+        `but the current capture names ${currentPackId ?? "(none)"}`,
+      );
+    }
+    const expectedTargetIds = expectedFinalization.targets.map((target) => target.targetId);
+    if (
+      expectedTargetIds.length !== committedHeader.targets.length ||
+      expectedTargetIds.some((targetId, index) => targetId !== committedHeader.targets[index])
+    ) {
+      throw new Error("ui-review: committed review recovery target set does not match the sealed record");
+    }
+    sealedTargets = expectedFinalization.targets.map((target) => {
+      if (
+        target.runId !== captureRun.run.runId ||
+        target.fingerprint !== targetFingerprint(captureRun.run, target.targetId) ||
+        target.disposition !== targetJudgmentDisposition(validationEvents, target.targetId)
+      ) {
+        throw new Error(`ui-review: committed review recovery identity does not match target ${target.targetId}`);
+      }
+      if (persistedPack) {
+        const packEvidence = persistedPack.pack.targetJudgmentEvidence?.[target.targetId];
+        const executedEvidence = {
+          baseEvidenceDigest: target.baseEvidenceDigest,
+          evidenceDigest: target.evidenceDigest,
+          rubricDigest: target.rubricDigest,
+          promptDigests: target.promptDigests,
+        };
+        if (
+          persistedPack.pack.targetFingerprints?.[target.targetId] !== target.fingerprint ||
+          !isDeepStrictEqual(packEvidence, executedEvidence)
+        ) {
+          throw new Error(`ui-review: committed review recovery evidence does not match executed pack target ${target.targetId}`);
+        }
+      }
+      return structuredClone(target);
+    });
+  } else {
+    const sealedEvidence = judgmentEvidenceForCapture({
+      cfg,
+      captureRun,
+      targetIds: committedHeader.targets,
+      persistedPack,
+      libraryLease,
+    });
+    sealedTargets = sealedTargetsForReview({
+      captureRun,
+      events: validationEvents,
+      targetIds: committedHeader.targets,
+      sealedEvidence,
+    });
+  }
+  const packResult = persistedPack
+    ? updateJudgePackJudgments({
+        cfg,
+        runDir: captureRun.runDir,
+        run: captureRun.run,
+        targets: sealedTargets,
+        judgeLock,
+      })
+    : null;
+  const cursorResult = sealJudgmentState(cfg, {
+    libraryLease,
+    targets: sealedTargets,
+    reconcileOnly: true,
+  });
+  const packUpdated = packResult?.updated === true;
+  const cursorUpdated = cursorResult.updated === true;
+  return {
+    finalized: true,
+    changed: packUpdated || cursorUpdated,
+    packUpdated,
+    cursorUpdated,
+    targets: sealedTargets,
+    completeness,
+  };
+}
+
+async function main() {
+  const o = parseArgs(process.argv.slice(2));
+  if (o.help) {
+    console.log(readFileSync(__filename, "utf8").split("\n").slice(2, 29).join("\n"));
+    return;
+  }
+  if (o.judgePack && !o.project && !o.config) {
+    const runPath = join(resolve(o.run), "run.json");
+    if (!existsSync(runPath)) throw new Error(`ui-review: judge-pack capture run.json not found: ${runPath}`);
+    const run = JSON.parse(readFileSync(runPath, "utf8"));
+    if (typeof run.project !== "string" || !run.project) {
+      throw new Error(`ui-review: judge-pack capture run has no project: ${runPath}`);
+    }
+    o.project = run.project;
+  }
+  const recordEvents = o.recordProvided ? readRecordEvents(o.record) : null;
+  if (recordEvents && !o.project && !o.config) o.project = recordEvents[0].project;
+  const cfg = loadConfig(o);
+  const cropRequests = !recordEvents && !o.verifyFresh ? loadCropRequests(cfg, o) : [];
+  if (o.judgePack) {
+    let requestedTargetIds = null;
+    if (o.targets) {
+      const selection = selectTargets(cfg, o);
+      if (selection.error) throw new Error(`ui-review: ${selection.error}`);
+      requestedTargetIds = selection.targets.map((target) => target.id);
+    }
+    const { buildJudgePack } = require(join(__dirname, "judge-pack.cjs"));
+    const result = buildJudgePack({
+      cfg,
+      runDir: resolve(o.run),
+      previousPackPath: o.previousPack,
+      targetIds: requestedTargetIds,
+    });
+    const report = {
+      project: cfg.name,
+      runId: result.pack.runId,
+      judgePack: {
+        path: result.path,
+        targets: result.pack.targets,
+        skippedTargets: result.pack.skippedTargets,
+        reselectedTargets: result.pack.reselectedTargets,
+        batches: result.pack.batches.length,
+        skippedUnchanged: result.pack.targets.length === 0,
+      },
+    };
+    if (o.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(`JUDGE PACK ${report.judgePack.batches} batch(es), ${report.judgePack.targets.length} target(s): ${report.judgePack.path}`);
+    return;
+  }
+  if (recordEvents) {
+    const header = recordEvents[0];
+    if (header.project !== cfg.name) {
+      throw new Error(`ui-review: record project ${header.project} does not match config ${cfg.name}`);
+    }
+    // A record preflight is strictly read-only. In particular, malformed or
+    // typo'd --run paths must fail before a judge directory or lock can be
+    // created inside the capture.
+    const capturePreflight = loadCompletedCaptureRun(o.run, cfg);
+    if (header.runId !== capturePreflight.run.runId) {
+      throw new Error(`ui-review: record header runId ${header.runId} does not match capture run ${capturePreflight.run.runId}`);
+    }
+    const { assertPersistedJudgePackMatchesCapture } = require(join(__dirname, "judge-pack.cjs"));
+    const preflightPack = assertPersistedJudgePackMatchesCapture(
+      capturePreflight.runDir,
+      capturePreflight.run,
+      header.targets,
+      capturePreflight.captureManifest,
+    );
+    // Historical judgepack.v1 manifests did not require evidence digests. The
+    // original bytes cannot be reconstructed exactly from today's mutable
+    // templates and exemplar state, so reject them before taking either lock
+    // or entering the review commit path.
+    persistedJudgmentEvidenceForRecord(preflightPack, header.targets, capturePreflight.runDir);
+    // Judge-pack building and execution resolve durable cursor/exemplar state
+    // under the project library lease, so the per-run judge lease must remain
+    // outermost whenever a persisted pack can be mutated. Packless recording
+    // has no run-local mutation and therefore uses only the external project
+    // library lease. An executor keeps its existing judge lease while invoking
+    // this command and delegates it only to its direct child through verified
+    // owner metadata.
+    const judgeLock = process.env[JUDGE_LOCK_OWNER_ENV] !== undefined
+      ? inheritJudgeLock(o.run, process.env[JUDGE_LOCK_OWNER_ENV])
+      : preflightPack
+        ? acquireJudgeLock(o.run, { createJudgeDir: false, projectRoot: cfg.root })
+        : null;
+    let libraryLease;
+    let result;
+    let captureRun = capturePreflight;
+    let persistedPack = preflightPack;
+    let recoveredFinalization = null;
+    try {
+      const finalizeRecovery = ({ libraryLease: recoveryLease, recovery }) => {
+        if (recovery.runId !== header.runId) {
+          // The library finalizes the journal's immutable cursor identity.
+          // Only the currently locked run can safely receive an optional pack
+          // mirror while this operation holds its judge lease.
+          return null;
+        }
+        captureRun = loadCompletedCaptureRun(o.run, cfg);
+        const recoveryPack = assertPersistedJudgePackMatchesCapture(
+          captureRun.runDir,
+          captureRun.run,
+          header.targets,
+          captureRun.captureManifest,
+        );
+        if (recoveryPack && !judgeLock) {
+          throw new Error("ui-review: a judge pack appeared during record validation; retry --record so it can be locked");
+        }
+        recoveredFinalization = finalizeCommittedReview({
+          cfg,
+          captureRun,
+          reviewPath: recovery.reviewPath,
+          libraryLease: recoveryLease,
+          judgeLock,
+          expectedFinalization: recovery.finalization,
+        });
+        return recoveredFinalization;
+      };
+      // Retention uses this same project lock, while appendReviewRecord takes
+      // review.json.lock inside it. This prevents a valid capture run from
+      // being pruned between validation and the review record's atomic append.
+      libraryLease = acquireLibraryLock(cfg, undefined, {
+        finalizeRecoveredReview: finalizeRecovery,
+      });
+      // Re-hash the completed capture after acquiring every lease that applies
+      // to this record. The preflight proves the path without mutation; this
+      // second load closes the validation-to-commit window.
+      captureRun = loadCompletedCaptureRun(o.run, cfg);
+      if (header.runId !== captureRun.run.runId) {
+        throw new Error(`ui-review: record header runId ${header.runId} does not match capture run ${captureRun.run.runId}`);
+      }
+      // A manual record must not be able to seal a capture after its
+      // already-built judge pack has gone stale. The pack stores the original
+      // base assets; only digest-bound verification crops may be added later,
+      // and every stored asset must still be byte-identical.
+      persistedPack = assertPersistedJudgePackMatchesCapture(
+        captureRun.runDir,
+        captureRun.run,
+        header.targets,
+        captureRun.captureManifest,
+        { verifyPackedArtifacts: true, judgeLock },
+      );
+      if (persistedPack && !judgeLock) {
+        throw new Error("ui-review: a judge pack appeared during record validation; retry --record so it can be locked");
+      }
+      let sealedEvidence = persistedJudgmentEvidenceForRecord(
+        persistedPack,
+        header.targets,
+        captureRun.runDir,
+      );
+      result = appendReviewRecord(recordEvents, {
+        projectRoot: cfg.root,
+        targetIds: cfg.routes.map((route) => route.id),
+        capturedTargetIds: captureRun.run.targetIds,
+        capturedTargetOutcomes: captureRun.run.targetOutcomes,
+        capturedTargetShotHashes: captureRun.run.targetShotHashes,
+        // appendReviewRecord invokes this while review.json.lock is held and
+        // only after validating the prospective combined log. A terminal
+        // append must prove that every target's judgment evidence is derivable
+        // before review.json becomes the transaction commit. Crop staging runs
+        // only after that proof and still exposes no final append-only paths
+        // before review.json commits.
+        beforeCommit(context) {
+          let finalization = null;
+          if (recordCompleteness(context.combinedEvents).complete) {
+            if (!sealedEvidence) {
+              sealedEvidence = judgmentEvidenceForCapture({
+                cfg,
+                captureRun,
+                targetIds: header.targets,
+                persistedPack,
+                libraryLease,
+              });
+            }
+            for (const targetId of header.targets) {
+              if (!sealedEvidence[targetId]) {
+                throw new Error(`ui-review: target ${targetId} has no judgment evidence for the prospective sealed record`);
+              }
+            }
+            finalization = {
+              version: 1,
+              packId: persistedPack?.pack.packId ?? null,
+              targets: sealedTargetsForReview({
+                captureRun,
+                events: context.combinedEvents,
+                targetIds: header.targets,
+                sealedEvidence,
+              }),
+            };
+          }
+          return persistReviewCrops({
+            cfg,
+            libraryLease,
+            runDir: captureRun.runDir,
+            run: captureRun.run,
+            events: recordEvents,
+            reviewPath: context.path,
+            combinedEvents: context.combinedEvents,
+            finalization,
+          });
+        },
+        afterCommit({ prepared }) {
+          prepared?.commit(finalizeRecovery);
+        },
+        onSealedExisting({ path, combinedEvents }) {
+          const replayed = recordEventsAlreadyCommitted(recordEvents, combinedEvents);
+          if (!replayed) return { handled: false };
+          const finalization = finalizeCommittedReview({
+            cfg,
+            captureRun,
+            reviewPath: path,
+            libraryLease,
+            judgeLock,
+          });
+          return {
+            handled: true,
+            ...finalization,
+            recovered: finalization.changed || recoveredFinalization?.changed === true,
+            replayed,
+            note: finalization.changed || recoveredFinalization?.changed
+              ? "sealed review finalized from committed log; no events appended"
+              : "sealed review was already finalized; duplicate event batch was not appended",
+          };
+        },
+      });
+      if (result.completeness.complete && !result.finalization && recoveredFinalization) {
+        result.finalization = recoveredFinalization;
+      }
+      if (result.completeness.complete && !result.finalization) {
+        result.finalization = finalizeCommittedReview({
+          cfg,
+          captureRun,
+          reviewPath: result.path,
+          libraryLease,
+          judgeLock,
+        });
+      }
+    } finally {
+      try {
+        if (libraryLease) releaseLibraryLock(libraryLease);
+      } finally {
+        if (judgeLock) releaseJudgeLock(judgeLock);
+      }
+    }
+    const report = {
+      project: cfg.name,
+      review: {
+        path: result.path,
+        events: result.events,
+        appended: result.appended,
+        status: result.completeness.status,
+        sealed: result.completeness.sealed,
+        seal: result.completeness.seal,
+        complete: result.completeness.complete,
+        initials: result.completeness.initials,
+        verifications: result.completeness.verifications,
+        dispositions: result.completeness.dispositions,
+        pendingFindingIds: result.completeness.pendingFindingIds,
+        finalization: result.finalization ?? null,
+      },
+    };
+    if (o.json) console.log(JSON.stringify(report, null, 2));
+    else {
+      console.log(
+        report.review.finalization?.note
+          ? `REVIEW finalized: ${report.review.finalization.note} — ${report.review.path}`
+          : report.review.complete
+          ? `REVIEW complete: ${report.review.dispositions} disposition(s) — ${report.review.path}`
+          : report.review.status === "unsealed"
+            ? `REVIEW unsealed: ${report.review.initials} finding(s) recorded; no terminal seal — ${report.review.path}`
+            : `REVIEW incomplete: pending ${report.review.pendingFindingIds.length} finding(s) — ${report.review.path}`,
+      );
+    }
+    return;
+  }
+  if (o.verifyFresh) {
+    const selection = selectTargets(cfg, o);
+    if (selection.error) throw new Error(`ui-review: ${selection.error}`);
+    const freshness = verifyFreshTargets(cfg, selection.targets, o.base);
+    const report = {
+      project: cfg.name,
+      base: o.base,
+      freshness,
+      fresh: freshness.filter((entry) => entry.status === "fresh").length,
+      staleOrNeverCaptured: freshness.filter((entry) => entry.status === "stale" || entry.status === "never-captured").length,
+      unverifiable: freshness.filter((entry) => entry.status === "unverifiable").length,
+    };
+    if (o.json) console.log(JSON.stringify(report, null, 2));
+    else for (const entry of freshness) console.log(`FRESH  ${entry.targetId}: ${entry.status} — ${entry.reason}`);
+    process.exitCode = report.fresh === freshness.length ? 0 : 3;
+    return;
+  }
+  const mode = captureMode(cfg);
+  // Capture preconditions must finish before allocating the fresh output
+  // directory. Otherwise an unavailable dependency, server, simulator, or
+  // external session consumes --out and makes the documented retry fail.
+  let targets = cfg.routes || [];
+  if (!o.shots && (o.targets || (o.scan && o.scanScope === "targets"))) {
+    const selection = selectTargets(cfg, o);
+    if (selection.error) throw new Error(`ui-review: ${selection.error}`);
+    targets = selection.targets;
+  }
+  if (o.shots) {
+    // Resolve target/group names before every other capture precondition. A
+    // typo must leave --out untouched so the corrected retry can use it.
+    const selection = selectTargets(cfg, o);
+    if (selection.error) {
+      const targetIds = cfg.routes.map((target) => target.id);
+      const groupNames = Object.keys(cfg.groups || {});
+      console.error(`ui-review: ${selection.error}`);
+      console.error(`  → valid target ids: ${targetIds.length ? targetIds.join(", ") : "(none)"}`);
+      console.error(`  → valid group names: ${groupNames.length ? groupNames.join(", ") : "(none)"}`);
+      process.exitCode = 2;
+      return;
+    }
+    targets = selection.targets;
+
+    // Preconditions run cheapest-and-purest first: a config lint needs no
+    // toolchain, no network and no simulator, so an unhonourable route shape is
+    // reported on any machine rather than being masked by a missing Xcode/AXe.
+    if (mode === "rn-sim") {
+      const invalid = validateRnTargets(targets);
+      if (invalid.length) {
+        console.error("ui-review: config is not valid for capture.mode rn-sim:");
+        for (const problem of invalid) console.error(`  → ${problem}`);
+        process.exitCode = 2;
+        return;
+      }
+    }
+    const missingDeps = missingRuntimeDeps(mode);
+    if (missingDeps.length) {
+      console.error(
+        `ui-review: missing runtime dependencies for capture.mode ${mode}: ` +
+          `${missingDeps.map((d) => d.name).join(", ")}.`,
+      );
+      for (const dep of missingDeps) console.error(`  → ${dep.hint}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!(await serverUp(cfg.baseUrl))) {
+      console.error(
+        `ui-review: ${mode === "rn-sim" ? "Metro bundler" : "dev server"} not reachable at ${cfg.baseUrl}.`,
+      );
+      if (cfg.startHint) console.error(`  → ${cfg.startHint}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (mode === "rn-sim") {
+      const notReady = simReady(cfg);
+      if (notReady) {
+        console.error(`ui-review: simulator not ready — ${notReady.error}`);
+        for (const hint of notReady.hints) console.error(`  → ${hint}`);
+        process.exitCode = 2;
+        return;
+      }
+    }
+    const sessionNotReady = await sessionReady(cfg, mode);
+    if (sessionNotReady) {
+      console.error(`ui-review: external session is not ready — ${sessionNotReady.error}`);
+      console.error(`  → ${sessionNotReady.bootstrapHint}`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+
+  const outDir = createFreshOutputDir(o.out || defaultOutDir(cfg.name), cfg.root);
+
+  const bundle = {
+    project: cfg.name,
+    root: cfg.root,
+    baseUrl: cfg.baseUrl,
+    captureMode: mode,
+    rubric: RUBRIC,
+    designDoc: cfg.designDoc ? resolveInProject(cfg, cfg.designDoc) : null,
+    intentDoc: cfg.intentDoc ? resolveIntentDoc(cfg, cfg.intentDoc) : null,
+    intentResolved: false,
+    outDir,
+    scan: null,
+    shots: null,
+    review: {
+      complete: false,
+      status: "unsealed",
+      reason: "no review record written (use ui-review --record <events.json> --run <capture-dir>)",
+      dispositions: 0,
+    },
+    library: o.noLibrary
+      ? { mode: "ephemeral", reason: "--no-library; excluded from manifest.jsonl" }
+      : { mode: "not-captured" },
+  };
+  bundle.intentResolved = !!(bundle.intentDoc && existsSync(bundle.intentDoc));
+
+  if (o.scan) bundle.scan = runScan(cfg, o, targets);
+
+  if (o.shots) {
+    bundle.shots = runShots(cfg, outDir, mode, targets, cropRequests);
+    bundle.judgeContext = buildJudgeContexts({
+      cfg,
+      targets,
+      scan: bundle.scan,
+      shots: bundle.shots,
+      intentPath: bundle.intentDoc,
+    });
+    for (const target of bundle.shots.targets || []) {
+      target.judgeContext = bundle.judgeContext[target.id];
+    }
+    if (!o.noLibrary) {
+      const captureManifest = bundle.shots;
+      const provenance = captureProvenance(cfg, captureManifest);
+      bundle.library = {
+        mode: "persistent",
+        stateDir: stateProjectDir(cfg.name),
+        runDir: null,
+        records: 0,
+      };
+      const persisted = persistRunBundle({ cfg, outDir, bundle, provenance });
+      bundle.library = {
+        mode: "persistent",
+        stateDir: stateProjectDir(cfg.name),
+        runDir: persisted.runDir,
+        manifest: persisted.manifest,
+        records: persisted.records,
+        retention: persisted.retention,
+      };
+    }
+  }
+  if (!bundle.judgeContext) {
+    bundle.judgeContext = buildJudgeContexts({ cfg, targets, scan: bundle.scan, shots: null, intentPath: bundle.intentDoc });
+  }
+
+  const bundlePath = join(outDir, "bundle.json");
+  writeFileSync(bundlePath, JSON.stringify(bundle, null, 2));
+
+  if (o.json) {
+    console.log(JSON.stringify(bundle, null, 2));
+  } else {
+    console.log(`autoreview-ui · ${cfg.name} · capture ${mode}\n`);
+    console.log(summarize(bundle));
+    console.log("");
+    if (!bundle.intentResolved) {
+      console.log(
+        `INTENT  not captured yet (${bundle.intentDoc || "no intentDoc configured"}).`,
+      );
+      console.log(
+        `        Derive from ${cfg.designDoc || "the design system"} + siblings; ask the user the per-screen gaps; persist it. (SKILL.md → Design intent)`,
+      );
+    }
+    console.log(`\nBundle: ${bundlePath}`);
+    console.log(`Shots:  ${join(outDir, "shots")}`);
+    console.log(`Rubric: ${RUBRIC}`);
+    console.log(
+      `\nNext (vision pass): read the screenshots, apply the rubric against the design intent,\n` +
+        `correlate with the scan findings, classify per the Scope Governor, then fix DRY and re-run.`,
+    );
+  }
+
+  process.exitCode = actionable(bundle) ? 1 : 0;
+}
+
+module.exports = {
+  applyTargetOutcomes,
+  actionable,
+  finalizeCaptureRun,
+  finalizeCommittedReview,
+  loadCompletedCaptureRun,
+  runShots,
+  selectTargets,
+  verifyFreshTargets,
+};
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`ui-review: ${err.message}`);
+    process.exitCode = 2;
+  });
+}

@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoreview-ui.dev/schemas/judgepack.v1.json",
+  "title": "Autoreview UI judge pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "packId",
+    "runId",
+    "project",
+    "createdAt",
+    "targets",
+    "targetFingerprints",
+    "judgedFingerprints",
+    "targetShotHashes",
+    "attachmentHashes",
+    "skippedTargets",
+    "batches",
+    "contexts",
+    "cropRequests",
+    "exemplars",
+    "artifacts"
+  ],
+  "properties": {
+    "version": { "const": "judgepack.v1" },
+    "packId": { "type": "string", "format": "uuid" },
+    "runId": { "type": "string", "format": "uuid" },
+    "project": { "type": "string", "minLength": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "targets": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "targetFingerprints": { "$ref": "#/$defs/fingerprints" },
+    "targetJudgmentEvidence": { "$ref": "#/$defs/targetJudgmentEvidence" },
+    "judgedFingerprints": { "$ref": "#/$defs/judgedFingerprints" },
+    "targetShotHashes": { "$ref": "#/$defs/targetShotHashes" },
+    "attachmentHashes": { "$ref": "#/$defs/attachmentHashes" },
+    "skippedTargets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["targetId", "reason"],
+        "properties": {
+          "targetId": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "reselectedTargets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["targetId", "reason"],
+        "properties": {
+          "targetId": { "type": "string", "minLength": 1 },
+          "reason": { "enum": ["evidence-changed", "rubric-changed"] }
+        }
+      }
+    },
+    "batches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "groupId", "anchorId", "targetIds", "checklistPhases", "imageList", "imageListDigest", "prompt", "promptDigest"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "groupId": { "type": ["string", "null"], "minLength": 1 },
+          "anchorId": { "type": ["string", "null"], "minLength": 1 },
+          "targetIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+          "checklistPhases": {
+            "type": "array",
+            "const": ["visual-polish", "layout-economy", "consistency", "accessibility", "intent"]
+          },
+          "imageList": { "type": "string", "minLength": 1 },
+          "imageListDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "prompt": { "type": "string", "minLength": 1, "description": "Base prompt artifact used with the packed image list and exemplars to deterministically re-render the final engine prompt." },
+          "promptDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$", "description": "SHA-256 of the complete final rendered prompt bytes passed to the engine, including the exemplar attachment map." }
+        }
+      }
+    },
+    "contexts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["targetId", "path"],
+        "properties": {
+          "targetId": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "cropRequests": { "type": "string", "minLength": 1 },
+    "exemplars": { "type": "array", "items": { "$ref": "#/$defs/exemplar" } },
+    "artifacts": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+  },
+  "$defs": {
+    "fingerprints": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "null"] }
+    },
+    "targetShotHashes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "propertyNames": { "pattern": "^[^\\\\]+$" },
+        "additionalProperties": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      }
+    },
+    "attachmentHashes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^sha256:[a-f0-9]{64}$"
+      }
+    },
+    "targetJudgmentEvidence": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/judgmentEvidence" }
+    },
+    "judgmentEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseEvidenceDigest", "evidenceDigest", "rubricDigest", "promptDigests"],
+      "properties": {
+        "baseEvidenceDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "evidenceDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "rubricDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "promptDigests": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+        }
+      }
+    },
+    "judgedFingerprints": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/$defs/judgedFingerprint" },
+          { "$ref": "#/$defs/fingerprint" }
+        ]
+      }
+    },
+    "fingerprint": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "judgedFingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fingerprint", "disposition"],
+      "properties": {
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "baseEvidenceDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "evidenceDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "rubricDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "promptDigests": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+        },
+        "disposition": { "enum": ["clean", "accepted", "rejected", "not-judged"] }
+      }
+    },
+    "exemplar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "screenshot", "rubricVersion", "curator", "expectedFindings", "severity"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "screenshot": { "$ref": "https://autoreview-ui.dev/schemas/exemplar.v1.json#/properties/screenshot" },
+        "rubricVersion": { "type": "string", "minLength": 1 },
+        "curator": { "type": "string", "minLength": 1 },
+        "expectedFindings": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "severity": { "enum": ["P0", "P1", "P2", "P3"] }
+      }
+    }
+  }
+}

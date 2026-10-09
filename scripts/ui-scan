@@ -1,0 +1,456 @@
+#!/usr/bin/env node
+/**
+ * ui-scan — static "laziness tells" scanner for autoreview-ui.
+ *
+ * Scopes to a change (like autoreview), derives the project's token + atom
+ * inventory, and flags the machine-detectable shortcuts: inline styles,
+ * hardcoded values where a token exists, raw elements where a design-system
+ * atom exists, stacked shadows, <style> tags, direct Hugeicons, em-dashes.
+ *
+ *   ui-scan                       # uncommitted changes vs HEAD (+ untracked)
+ *   ui-scan --base origin/main    # branch + working tree diff
+ *   ui-scan --staged              # staged only
+ *   ui-scan --files a.tsx,b.css   # explicit files (scanned whole)
+ *   ui-scan --all                 # every UI file under the repo
+ *   ui-scan --json                # machine-readable findings
+ *   ui-scan --include apps/mobile/src   # restrict to path prefix(es)
+ *   ui-scan --ignore-rules hugeicons-direct   # rule ids a project's documented
+ *                                 # conventions contradict; reported, not counted
+ *
+ * Two rulesets, chosen with --ruleset (default web-css):
+ *   web-css        CSS + DOM: globals.css tokens (--globals), a design system
+ *                  barrel (--barrel), and .tsx/.jsx/.css files.
+ *   rn-stylesheet  React Native: TS token modules (--tokens-dir), a component
+ *                  inventory doc (--components-doc), and .tsx files.
+ *
+ * Exit 0 = no findings at/above --min-confidence; nonzero = findings present;
+ * 2 = usage or scan error (including an --ignore-rules id the ruleset lacks).
+ */
+
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const { existsSync, readFileSync, readdirSync, statSync } = require("node:fs");
+const { dirname, isAbsolute, join, relative, resolve } = require("node:path");
+
+/** Join under base unless already absolute. */
+const under = (base, p) => (isAbsolute(p) ? p : join(base, p));
+const {
+  RULE_IDS,
+  deriveTokens,
+  deriveAtoms,
+  partitionIgnoredRules,
+  scanFileContent,
+} = require("./ui-scan-core.cjs");
+const {
+  RN_RULE_IDS,
+  deriveRnTokens,
+  deriveRnAtoms,
+  scanRnFileContent,
+} = require("./ui-scan-core-rn.cjs");
+
+/**
+ * Per-ruleset substrate. `ext` decides which files are UI files at all; RN also
+ * excludes type declarations and test files, which have no rendered surface.
+ * `ruleIds` is the set --ignore-rules is checked against.
+ */
+const RULESETS = {
+  "web-css": { ext: /\.(tsx|jsx|css)$/, ruleIds: RULE_IDS },
+  "rn-stylesheet": {
+    ext: /\.tsx$/,
+    exclude: /\.d\.ts$|\.test\.[tj]sx?$|(^|\/)__tests__\//,
+    ruleIds: RN_RULE_IDS,
+  },
+};
+
+function parseArgs(argv) {
+  const opts = {
+    root: process.cwd(),
+    base: null,
+    staged: false,
+    all: false,
+    files: null,
+    json: false,
+    // Default hides low-confidence rules (e.g. em-dash) — they drown signal in
+    // content-heavy apps. Lower it (e.g. --min-confidence 0.3) to include them.
+    minConfidence: 0.5,
+    globals: null,
+    barrels: [],
+    ruleset: "web-css",
+    include: null,
+    tokensDir: null,
+    componentsDoc: null,
+    ignoreRules: [],
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--base") opts.base = argv[++i];
+    else if (a === "--staged") opts.staged = true;
+    else if (a === "--all") opts.all = true;
+    else if (a === "--files") opts.files = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
+    else if (a === "--root") opts.root = resolve(argv[++i]);
+    else if (a === "--json") opts.json = true;
+    else if (a === "--min-confidence") opts.minConfidence = parseFloat(argv[++i]);
+    else if (a === "--globals") opts.globals = argv[++i];
+    else if (a === "--barrel") opts.barrels.push(argv[++i]);
+    else if (a === "--ruleset") opts.ruleset = argv[++i];
+    else if (a === "--include") opts.include = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
+    else if (a === "--tokens-dir") opts.tokensDir = argv[++i];
+    else if (a === "--components-doc") opts.componentsDoc = argv[++i];
+    else if (a === "--ignore-rules") {
+      const value = argv[++i];
+      const ids = typeof value === "string" && !value.startsWith("--")
+        ? value.split(",").map((s) => s.trim()).filter(Boolean)
+        : [];
+      if (!ids.length) throw new Error("--ignore-rules requires a comma-separated list of rule ids");
+      opts.ignoreRules.push(...ids);
+    }
+    else if (a === "--help" || a === "-h") opts.help = true;
+  }
+  if (!RULESETS[opts.ruleset]) {
+    throw new Error(
+      `unknown --ruleset "${opts.ruleset}" (expected ${Object.keys(RULESETS).join(" or ")})`,
+    );
+  }
+  // An unknown id would ignore nothing and hide the typo; refuse it instead.
+  const known = RULESETS[opts.ruleset].ruleIds;
+  const unknown = [...new Set(opts.ignoreRules)].filter((id) => !known.includes(id));
+  if (unknown.length) {
+    throw new Error(
+      `unknown --ignore-rules id(s) for ruleset ${opts.ruleset}: ${unknown.join(", ")} ` +
+        `(known: ${known.join(", ")})`,
+    );
+  }
+  opts.ignoreRules = [...new Set(opts.ignoreRules)];
+  return opts;
+}
+
+/** Is this path a UI file for the selected ruleset? */
+function isUiFile(opts, file) {
+  const spec = RULESETS[opts.ruleset];
+  if (!spec.ext.test(file)) return false;
+  if (spec.exclude && spec.exclude.test(file)) return false;
+  return true;
+}
+
+/** Path-prefix filter from --include (no filter = everything). */
+function isIncluded(opts, file) {
+  if (!opts.include?.length) return true;
+  return opts.include.some((prefix) => file === prefix || file.startsWith(`${prefix}/`));
+}
+
+function git(root, args) {
+  const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  if (r.status !== 0) {
+    const detail = (r.stderr || r.stdout || "").trim();
+    throw new Error(`git ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`);
+  }
+  return r.stdout;
+}
+
+function mergeBase(root, base) {
+  return git(root, ["merge-base", base, "HEAD"]).trim();
+}
+
+/** Parse `git diff --unified=0` into a map of file → Set(new-side added lines). */
+function parseDiff(diff) {
+  const files = new Map();
+  let current = null;
+  let newLine = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++ ")) {
+      const path = line.slice(4).replace(/^b\//, "");
+      if (path === "/dev/null") {
+        current = null;
+        continue;
+      }
+      current = path;
+      if (!files.has(current)) files.set(current, new Set());
+    } else if (line.startsWith("@@")) {
+      const m = /\+(\d+)(?:,(\d+))?/.exec(line);
+      newLine = m ? parseInt(m[1], 10) : 0;
+    } else if (current && line.startsWith("+") && !line.startsWith("+++")) {
+      files.get(current).add(newLine);
+      newLine++;
+    }
+  }
+  return files;
+}
+
+function walk(dir, root, out, opts) {
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return out;
+  }
+  for (const name of entries) {
+    if (name === "node_modules" || name === ".git" || name === ".next") continue;
+    const full = join(dir, name);
+    // throwIfNoEntry:false tolerates broken symlinks; skip anything unreadable.
+    const st = statSync(full, { throwIfNoEntry: false });
+    if (!st) continue;
+    if (st.isDirectory()) walk(full, root, out, opts);
+    else {
+      const rel = relative(root, full);
+      if (isUiFile(opts, rel)) out.push(rel);
+    }
+  }
+  return out;
+}
+
+/** Resolve the change-set: [{ file, added:Set|null }]. added=null → whole file. */
+function resolveTargets(opts) {
+  return selectTargets(opts).filter((t) => isIncluded(opts, t.file));
+}
+
+function selectTargets(opts) {
+  if (opts.files) return opts.files.map((file) => ({ file, added: null }));
+  if (opts.all) return walk(opts.root, opts.root, [], opts).map((file) => ({ file, added: null }));
+
+  const range = opts.base
+    ? [mergeBase(opts.root, opts.base)]
+    : opts.staged
+      ? ["--cached"]
+      // `git diff HEAD` intentionally includes staged and unstaged tracked
+      // changes. Untracked files are appended below for local pre-commit mode.
+      : ["HEAD"];
+  let diff;
+  try {
+    diff = git(opts.root, ["diff", "--unified=0", "--no-color", ...range]);
+  } catch (err) {
+    if (!opts.base && !opts.staged && /ambiguous argument 'HEAD'|unknown revision/i.test(err.message)) {
+      diff = "";
+    } else {
+      throw err;
+    }
+  }
+  const map = parseDiff(diff);
+  const targets = [...map.entries()].map(([file, added]) => ({ file, added }));
+
+  // Untracked files (local mode only) are scanned whole.
+  if (!opts.staged) {
+    const untracked = git(opts.root, [
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+    ])
+      .split("\n")
+      .filter((f) => f && isUiFile(opts, f));
+    for (const file of untracked) targets.push({ file, added: null });
+  }
+  return targets.filter((t) => isUiFile(opts, t.file));
+}
+
+/**
+ * React Native inventory: every token module in --tokens-dir plus the component
+ * inventory doc. Unlike the web path there are no auto-probed defaults — RN
+ * projects put these wherever they like, so the config states them explicitly.
+ */
+function loadRnInventory(opts) {
+  const themeFiles = [];
+  let tokensPath = null;
+  if (opts.tokensDir) {
+    tokensPath = opts.tokensDir;
+    const dir = under(opts.root, opts.tokensDir);
+    for (const name of readdirSync(dir)) {
+      if (!/\.ts$/.test(name) || /\.d\.ts$/.test(name)) continue;
+      themeFiles.push({
+        path: name,
+        content: readFileSync(join(dir, name), "utf8"),
+      });
+    }
+  }
+  const docPath = opts.componentsDoc || null;
+  const atoms = docPath
+    ? deriveRnAtoms(readFileSync(under(opts.root, docPath), "utf8"))
+    : new Set();
+  const barrelPaths = opts.barrels;
+  for (const barrelPath of barrelPaths) {
+    for (const component of deriveAtoms(
+      readFileSync(under(opts.root, barrelPath), "utf8"),
+      (specifier, fromFile) => resolveExportModule(opts.root, fromFile, specifier),
+      barrelPath,
+    )) {
+      atoms.add(component);
+    }
+  }
+  return {
+    tokens: deriveRnTokens(themeFiles),
+    atoms,
+    globalsPath: tokensPath,
+    barrelPath: docPath,
+    barrelPaths,
+  };
+}
+
+function loadInventory(opts) {
+  if (opts.ruleset === "rn-stylesheet") return loadRnInventory(opts);
+  const g =
+    opts.globals ||
+    ["app/globals.css", "src/app/globals.css", "styles/globals.css"].find((p) =>
+      existsSync(join(opts.root, p)),
+    );
+  const barrelPaths = opts.barrels.length
+    ? opts.barrels
+    : [
+        "components/design-system/index.ts",
+        "src/components/design-system/index.ts",
+      ].filter((p) => existsSync(join(opts.root, p))).slice(0, 1);
+  const tokens = g
+    ? deriveTokens(readFileSync(under(opts.root, g), "utf8"))
+    : { names: new Set(), categories: {} };
+  const atoms = new Set();
+  for (const barrelPath of barrelPaths) {
+    for (const component of deriveAtoms(
+      readFileSync(under(opts.root, barrelPath), "utf8"),
+      (specifier, fromFile) => resolveExportModule(opts.root, fromFile, specifier),
+      barrelPath,
+    )) {
+      atoms.add(component);
+    }
+  }
+  return {
+    tokens,
+    atoms,
+    globalsPath: g || null,
+    barrelPath: barrelPaths[0] || null,
+    barrelPaths,
+  };
+}
+
+function resolveExportModule(root, fromFile, specifier) {
+  if (!specifier.startsWith(".")) return null;
+  const fromDir = dirname(under(root, fromFile));
+  const base = resolve(fromDir, specifier);
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    join(base, "index.ts"),
+    join(base, "index.tsx"),
+    join(base, "index.js"),
+    join(base, "index.jsx"),
+  ];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    return {
+      source: relative(root, candidate),
+      content: readFileSync(candidate, "utf8"),
+    };
+  }
+  return null;
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (opts.help) {
+    // Print the header comment (everything between the shebang/opener and the
+    // closing " */"), so it stays complete as the usage block grows.
+    const lines = readFileSync(__filename, "utf8").split("\n");
+    console.log(lines.slice(2, lines.indexOf(" */")).join("\n"));
+    return;
+  }
+  const inv = loadInventory(opts);
+  const targets = resolveTargets(opts);
+  const detected = [];
+  for (const { file, added } of targets) {
+    const abs = under(opts.root, file);
+    if (!existsSync(abs)) continue;
+    const content = readFileSync(abs, "utf8");
+    const scan = opts.ruleset === "rn-stylesheet" ? scanRnFileContent : scanFileContent;
+    const fileFindings = scan(file, content, added, {
+      tokens: inv.tokens,
+      atoms: inv.atoms,
+    }).filter((f) => f.confidence >= opts.minConfidence);
+    detected.push(...fileFindings);
+  }
+  // Ignored rules are counted at the same confidence floor, so each count is
+  // exactly the number of findings the rule would otherwise have reported.
+  const { kept: findings, ignoredByRule } = partitionIgnoredRules(detected, opts.ignoreRules);
+  findings.sort((a, b) =>
+    a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1,
+  );
+
+  if (opts.json) {
+    console.log(
+      JSON.stringify(
+        {
+          ruleset: opts.ruleset,
+          inventory: {
+            globals: inv.globalsPath,
+            barrel: inv.barrelPath,
+            barrels: inv.barrelPaths || (inv.barrelPath ? [inv.barrelPath] : []),
+            components: [...inv.atoms].sort(),
+            // Kept for existing consumers; components is the full Pass 2
+            // value-export inventory and is the canonical field going forward.
+            atoms: [...inv.atoms].sort(),
+            tokenCount: inv.tokens.names.size,
+          },
+          summary: {
+            files: targets.length,
+            scannedFiles: targets.map((target) => target.file),
+            findings: findings.length,
+            byRule: countBy(findings, "rule"),
+            // Rule id → hits suppressed by --ignore-rules (0 included); these
+            // are excluded from findings, byRule and the exit code.
+            ignoredByRule,
+          },
+          findings,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    printText(findings, targets.length, inv, opts, ignoredByRule);
+  }
+  // Set exitCode (not process.exit) so large piped stdout flushes fully.
+  process.exitCode = findings.length > 0 ? 1 : 0;
+}
+
+function countBy(items, key) {
+  return items.reduce((acc, x) => ((acc[x[key]] = (acc[x[key]] || 0) + 1), acc), {});
+}
+
+function printText(findings, fileCount, inv, opts, ignoredByRule = {}) {
+  if (!inv.globalsPath) {
+    console.error(
+      opts.ruleset === "rn-stylesheet"
+        ? "ui-scan: warning — no --tokens-dir; token-drift rules limited."
+        : "ui-scan: warning — globals.css not found; color rules limited.",
+    );
+  }
+  const ignored = Object.entries(ignoredByRule);
+  const ignoredLine = ignored.length
+    ? `Ignored by --ignore-rules, not counted: ${ignored.map(([rule, n]) => `${rule} (${n} hit${n === 1 ? "" : "s"})`).join(", ")}.`
+    : null;
+  if (findings.length === 0) {
+    console.log(`ui-scan clean: no laziness tells in ${fileCount} changed file(s).`);
+    if (ignoredLine) console.log(ignoredLine);
+    return;
+  }
+  let lastFile = null;
+  for (const f of findings) {
+    if (f.file !== lastFile) {
+      console.log(`\n${f.file}`);
+      lastFile = f.file;
+    }
+    const conf = f.confidence >= 0.9 ? "high" : f.confidence >= 0.6 ? "med" : "low";
+    console.log(`  ${f.line}: [${f.rule}/${conf}] ${f.message}`);
+    if (f.suggestion) console.log(`        → ${f.suggestion}`);
+  }
+  console.log(
+    `\n${findings.length} finding(s) across ${fileCount} file(s). Verify each before fixing.`,
+  );
+  if (ignoredLine) console.log(ignoredLine);
+}
+
+try {
+  main();
+} catch (err) {
+  console.error(`ui-scan: ${err.message}`);
+  process.exitCode = 2;
+}

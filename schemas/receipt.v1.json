@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoreview-ui.dev/schemas/receipt.v1.json",
+  "title": "Autoreview UI project-owned state receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "project",
+    "stateProfile",
+    "account",
+    "appBuild",
+    "device",
+    "sessionId",
+    "preparedAt",
+    "expiresAt",
+    "outcome",
+    "producer"
+  ],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "project": { "type": "string", "minLength": 1 },
+    "stateProfile": { "type": "string", "minLength": 1 },
+    "account": { "type": "string", "minLength": 1 },
+    "appBuild": { "type": "string", "minLength": 1 },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "udid": { "type": "string", "minLength": 1 },
+        "runtime": { "type": "string", "minLength": 1 }
+      }
+    },
+    "sessionId": { "type": "string", "minLength": 1 },
+    "preparedAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" },
+    "outcome": { "enum": ["prepared", "failed"] },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

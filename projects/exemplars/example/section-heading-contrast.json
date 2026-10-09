@@ -1,0 +1,12 @@
+{
+  "screenshot": {
+    "status": "unavailable",
+    "reason": "No retained immutable settings capture is present in the example library."
+  },
+  "rubricVersion": "rubric.v1",
+  "curator": "example ui:review triage, 2026-08-11",
+  "expectedFindings": [
+    "Section headings must use a text token with readable contrast on the page background; a faint muted treatment is not enough."
+  ],
+  "severity": "P2"
+}

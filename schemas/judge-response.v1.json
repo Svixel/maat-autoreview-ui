@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoreview-ui.dev/schemas/judge-response.v1.json",
+  "title": "Autoreview UI initial judge response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings", "coverage"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "maxItems": 12,
+      "items": { "$ref": "finding.v2.json" }
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["targetId", "phase", "result"],
+        "properties": {
+          "targetId": { "type": "string", "minLength": 1 },
+          "phase": {
+            "enum": ["visual-polish", "layout-economy", "consistency", "accessibility", "intent"]
+          },
+          "result": { "enum": ["clean", "findings", "not-judged"] }
+        }
+      }
+    }
+  }
+}

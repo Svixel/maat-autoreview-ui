@@ -1,0 +1,14 @@
+node_modules/
+.secrets/
+library/
+*.log
+
+# Private project configs, intent docs and exemplars stay local.
+projects/*.json
+!projects/example.json
+projects/intent/*
+!projects/intent/example.md
+!projects/intent/.gitkeep
+projects/exemplars/*
+!projects/exemplars/README.md
+!projects/exemplars/example/

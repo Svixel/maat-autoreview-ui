@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoreview-ui.dev/schemas/finding.v2.json",
+  "title": "Autoreview UI finding record v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "ruleId",
+    "targetId",
+    "assetId",
+    "region",
+    "evidence",
+    "priority",
+    "confidence",
+    "initialVerdict",
+    "verifierVerdict",
+    "disposition",
+    "scope"
+  ],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "ruleId": { "type": "string", "minLength": 1 },
+    "targetId": { "type": "string", "minLength": 1 },
+    "assetId": { "type": "string", "minLength": 1 },
+    "region": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h", "normalized"],
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "w": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "h": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "normalized": { "const": true }
+      }
+    },
+    "cropId": { "type": "string", "minLength": 1 },
+    "cropDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "evidence": { "type": "string", "minLength": 1 },
+    "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "initialVerdict": { "enum": ["finding", "not-judged"] },
+    "verifierVerdict": { "enum": ["confirmed", "rejected", "not-judged"] },
+    "disposition": { "enum": ["accepted", "rejected", "not-judged"] },
+    "exemplarRefs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "scope": { "enum": ["in-scope", "follow-up", "escalate"] }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["cropDigest"] },
+      "then": { "required": ["cropId"] }
+    }
+  ]
+}

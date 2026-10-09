@@ -1,0 +1,20 @@
+{
+  "name": "autoreview-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vision + static UI/design closeout review. Self-contained; reads any running project's dev server, never writes into the project repo. (No top-level \"type\": extensionless CLIs are CJS; shoot.mjs is ESM by extension.)",
+  "bin": {
+    "ui-scan": "scripts/ui-scan",
+    "ui-review": "scripts/ui-review",
+    "ui-judge": "scripts/ui-judge"
+  },
+  "scripts": {
+    "bootstrap": "npm ci",
+    "test": "node --test tests/*.test.cjs",
+    "postinstall": "find node_modules -name SKILL.md -delete 2>/dev/null || true"
+  },
+  "dependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "1.60.0"
+  }
+}

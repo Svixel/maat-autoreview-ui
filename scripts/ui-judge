@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+"use strict";
+
+const { runJudge } = require("./judge-runner.cjs");
+
+function parseArgs(argv) {
+  const options = { pack: null, config: null, engine: "api", json: false };
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    if (arg === "--pack") options.pack = argv[++index];
+    else if (arg === "--config") options.config = argv[++index];
+    else if (arg === "--engine") options.engine = argv[++index];
+    else if (arg === "--json") options.json = true;
+    else if (arg === "--help" || arg === "-h") options.help = true;
+    else throw new Error(`ui-judge: unknown option ${arg}`);
+  }
+  if (options.help) return options;
+  if (!options.pack || typeof options.pack !== "string" || options.pack.startsWith("--")) {
+    throw new Error("ui-judge: --pack <capture-dir>/judge/manifest.json is required");
+  }
+  if (!new Set(["api", "codex"]).has(options.engine)) throw new Error("ui-judge: --engine must be api or codex");
+  return options;
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.help) {
+    console.log("ui-judge --pack <capture-dir>/judge/manifest.json [--config path] [--engine api|codex] [--json]");
+    return;
+  }
+  const result = await runJudge({ packPath: options.pack, configPath: options.config, engineName: options.engine });
+  if (options.json) console.log(JSON.stringify(result, null, 2));
+  else console.log(`ui-judge: ${result.outcome}${result.note ? ` — ${result.note}` : ""}`);
+}
+
+main().catch((err) => {
+  console.error(`ui-judge: ${err.message}${err.outcomePath ? `\nneeds-agent: ${err.outcomePath}` : ""}`);
+  process.exitCode = 1;
+});

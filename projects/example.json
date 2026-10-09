@@ -1,0 +1,76 @@
+{
+  "configVersion": 2,
+  "name": "example",
+  "root": "/path/to/acme-web",
+  "baseUrl": "http://127.0.0.1:3000",
+  "startHint": "Run `npm run dev` in /path/to/acme-web so the app serves http://127.0.0.1:3000.",
+  "tokensCss": "src/styles/tokens.css",
+  "designDoc": "docs/design-system.md",
+  "intentDoc": "skill:projects/intent/example.md",
+  "auth": {
+    "mode": "none"
+  },
+  "viewports": [
+    { "name": "w390", "width": 390, "height": 844 },
+    { "name": "w1440", "width": 1440, "height": 900 }
+  ],
+  "capture": {
+    "navigationTimeoutMs": 60000,
+    "waitForTimeoutMs": 30000
+  },
+  "scan": {
+    "ruleset": "web-css",
+    "include": ["src"],
+    "barrels": ["src/components/ui/atoms/index.ts"]
+  },
+  "reviewGroups": [
+    {
+      "id": "account",
+      "targetIds": ["settings", "profile"],
+      "anchorId": "settings",
+      "purpose": "Account pages share one page shell, header and form treatment."
+    }
+  ],
+  "routes": [
+    {
+      "id": "home",
+      "route": "/",
+      "role": null,
+      "waitFor": "h1",
+      "fullPage": true,
+      "sourceFiles": ["src/app/page.tsx"],
+      "interactions": [
+        { "id": "primary-cta-hover", "action": "hover", "selector": "main a.button-primary" },
+        { "id": "primary-cta-focus", "action": "focus", "selector": "main a.button-primary" }
+      ]
+    },
+    {
+      "id": "sign-in",
+      "route": "/sign-in",
+      "role": null,
+      "waitFor": "form",
+      "fullPage": true,
+      "sourceFiles": ["src/app/sign-in/page.tsx"],
+      "interactions": [
+        { "id": "email-focus", "action": "focus", "selector": "input[name='email']" },
+        { "id": "submit-hover", "action": "hover", "selector": "button[type='submit']" }
+      ]
+    },
+    {
+      "id": "settings",
+      "route": "/settings",
+      "role": null,
+      "waitFor": "h1",
+      "fullPage": true,
+      "sourceFiles": ["src/app/settings/page.tsx"]
+    },
+    {
+      "id": "profile",
+      "route": "/settings/profile",
+      "role": null,
+      "waitFor": "h1",
+      "fullPage": true,
+      "sourceFiles": ["src/app/settings/profile/page.tsx"]
+    }
+  ]
+}

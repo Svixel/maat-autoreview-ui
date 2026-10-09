@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoreview-ui.dev/schemas/config.v2.json",
+  "title": "Autoreview UI project config v2",
+  "type": "object",
+  "required": ["name", "root", "baseUrl", "routes"],
+  "properties": {
+    "configVersion": { "enum": [1, 2] },
+    "name": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" },
+    "root": { "type": "string", "minLength": 1 },
+    "baseUrl": { "type": "string", "minLength": 1 },
+    "routes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/target" }
+    },
+    "groups": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": { "type": "string", "minLength": 1 }
+      }
+    },
+    "reviewGroups": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/reviewGroup" }
+    },
+    "cropRequests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cropRequest" }
+    },
+    "judgeContext": { "$ref": "#/$defs/judgeContext" },
+    "judge": { "$ref": "#/$defs/judge" },
+    "library": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keepRuns": { "type": "integer", "minimum": 1 },
+        "maxBytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "scan": { "$ref": "#/$defs/scan" },
+    "capture": {
+      "type": "object",
+      "properties": {
+        "mode": { "enum": ["playwright", "rn-sim"] },
+        "session": { "$ref": "#/$defs/session" },
+        "scrollProbe": { "$ref": "#/$defs/scrollProbe" },
+        "navigationTimeoutMs": {
+          "description": "Playwright only. Bounds page.goto (to the load event) and the dev-login request. Default 30000.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "waitForTimeoutMs": {
+          "description": "Playwright only. Bounds each target's waitFor visibility wait. Default 15000.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["mode"], "properties": { "mode": { "const": "rn-sim" } } },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["navigationTimeoutMs"] },
+                { "required": ["waitForTimeoutMs"] }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "required": ["id", "route"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" },
+        "route": { "type": "string" },
+        "params": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean", "null"] } },
+        "waitFor": { "type": "string", "minLength": 1 },
+        "stateProfile": { "type": "string", "minLength": 1 },
+        "sourceFiles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "captureVariants": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "scrollProbe": { "$ref": "#/$defs/scrollProbe" },
+        "flow": { "type": "string", "minLength": 1 },
+        "_note": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "reviewGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "targetIds", "anchorId", "purpose"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "targetIds": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "anchorId": { "type": "string", "minLength": 1 },
+        "purpose": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ruleset": { "enum": ["web-css", "rn-stylesheet"] },
+        "include": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "tokensDir": { "type": "string", "minLength": 1 },
+        "componentsDoc": { "type": "string", "minLength": 1 },
+        "barrels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "shellPolicy": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/shellPolicyRule" }
+        },
+        "ignoreRules": {
+          "description": "Scan rule ids that contradict this project's documented conventions. Each id must belong to the configured ruleset. Ignored hits are counted and reported, never counted as findings.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["ruleset"], "properties": { "ruleset": { "const": "rn-stylesheet" } } },
+          "then": {
+            "properties": {
+              "ignoreRules": {
+                "items": {
+                  "enum": [
+                    "rn-hardcoded-color",
+                    "rn-hardcoded-size",
+                    "rn-activity-indicator",
+                    "rn-native-os-ui",
+                    "rn-emoji",
+                    "em-dash",
+                    "rn-a11y-pressable",
+                    "rn-a11y-image",
+                    "rn-a11y-switch",
+                    "rn-reinvented-component",
+                    "rn-solid-chrome"
+                  ]
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "ignoreRules": {
+                "items": {
+                  "enum": [
+                    "inline-style-literal",
+                    "reinvented-component",
+                    "style-tag",
+                    "hugeicons-direct",
+                    "em-dash",
+                    "hardcoded-color",
+                    "hardcoded-length",
+                    "stacked-shadow",
+                    "hardcoded-shadow"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "shellPolicyRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["routeClass", "match", "require", "exceptions"],
+      "properties": {
+        "routeClass": { "type": "string", "minLength": 1 },
+        "match": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "require": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "exceptions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bootstrapHint", "readiness", "timeoutMs"],
+      "properties": {
+        "bootstrapHint": { "type": "string", "minLength": 1 },
+        "readiness": { "type": "string", "minLength": 1 },
+        "timeoutMs": { "type": "integer", "exclusiveMinimum": 0 },
+        "launchArgs": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resetBetweenTargets": { "type": "boolean" }
+      }
+    },
+    "normalizedRect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h", "normalized"],
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "w": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "h": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "normalized": { "const": true }
+      }
+    },
+    "cropRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetId", "purpose"],
+      "properties": {
+        "assetId": { "type": "string", "minLength": 1 },
+        "rect": { "$ref": "#/$defs/normalizedRect" },
+        "axSelector": { "type": "string", "minLength": 1 },
+        "purpose": { "type": "string", "minLength": 1 }
+      },
+      "oneOf": [
+        { "required": ["rect"], "not": { "required": ["axSelector"] } },
+        { "required": ["axSelector"], "not": { "required": ["rect"] } }
+      ]
+    },
+    "scrollProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "containerSelector": { "type": "string", "minLength": 1 },
+        "footerSelector": { "type": "string", "minLength": 1 },
+        "maxSwipes": { "type": "integer", "minimum": 1 },
+        "swipePercent": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+        "settleMs": { "type": "integer", "minimum": 0 },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sliverExtentViewportRatio": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "judgeContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxBytes": { "type": "integer", "minimum": 256 }
+      }
+    },
+    "judge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "enum": ["openai"] },
+        "model": { "type": "string", "minLength": 1 },
+        "reasoningEffort": { "enum": ["none", "minimal", "low", "medium", "high", "xhigh"] },
+        "apiKeyEnv": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "maxRetries": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "maxFindingsPerBatch": { "type": "integer", "minimum": 1, "maximum": 12 },
+        "maxImagesPerBatch": { "type": "integer", "minimum": 2, "maximum": 8 },
+        "maxFindingsPerRun": { "type": "integer", "minimum": 1 },
+        "timeoutMs": { "type": "integer", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "screenshot": {
+    "status": "unavailable",
+    "reason": "No retained immutable dashboard capture is present in the example library."
+  },
+  "rubricVersion": "rubric.v1",
+  "curator": "example ui:review triage, 2026-08-11",
+  "expectedFindings": [
+    "Card labels must not break a single word across lines inside a narrow fixed-width card; give the card enough width or an intentional two-line treatment."
+  ],
+  "severity": "P2"
+}
